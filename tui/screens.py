@@ -147,8 +147,14 @@ class DashboardScreen:
             pass
         
         # Uptime
-        import uptime
-        up = uptime.uptime()
+        try:
+            import uptime
+            up = uptime.uptime()
+        except ImportError:
+            # Fallback if uptime module not available
+            with open('/proc/uptime', 'r') as f:
+                up = float(f.readline().split()[0])
+        
         days = int(up // 86400)
         hours = int((up % 86400) // 3600)
         mins = int((up % 3600) // 60)

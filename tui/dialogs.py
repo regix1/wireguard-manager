@@ -3,6 +3,7 @@ TUI Dialog Components for user interactions.
 """
 
 from typing import Optional, Dict, List, Any
+from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt, Confirm, IntPrompt
@@ -299,7 +300,6 @@ class RulesEditorDialog:
     
     def show(self):
         """Show the rules editor."""
-        from pathlib import Path
         import tempfile
         import subprocess
         import os
