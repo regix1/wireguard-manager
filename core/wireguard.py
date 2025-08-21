@@ -76,7 +76,10 @@ class WireGuardManager:
             elif line.startswith('private key:'):
                 continue  # Don't expose private key
             elif line.startswith('listening port:'):
-                status['listening_port'] = int(line.split(':', 1)[1].strip())
+                try:
+                    status['listening_port'] = int(line.split(':', 1)[1].strip())
+                except ValueError:
+                    status['listening_port'] = 0
             elif line.startswith('peer:'):
                 if current_peer:
                     status['peers'].append(current_peer)
@@ -106,7 +109,14 @@ class WireGuardManager:
                         current_peer['transfer_tx'] = self._parse_bytes(part)
                         status['total_tx'] += current_peer['transfer_tx']
             elif line.startswith('persistent keepalive:') and current_peer:
-                current_peer['persistent_keepalive'] = int(line.split(':', 1)[1].strip().split()[0])
+                try:
+                    keepalive_str = line.split(':', 1)[1].strip().split()[0]
+                    if keepalive_str.lower() not in ['every', 'off', 'none']:
+                        current_peer['persistent_keepalive'] = int(keepalive_str)
+                    else:
+                        current_peer['persistent_keepalive'] = 0
+                except (ValueError, IndexError):
+                    current_peer['persistent_keepalive'] = 0
         
         if current_peer:
             status['peers'].append(current_peer)
@@ -429,7 +439,14 @@ PersistentKeepalive = {self.settings.server.persistent_keepalive}
                     if len(ip_list) > 1:
                         current_peer.routed_networks = ip_list[1:]
             elif line.startswith('PersistentKeepalive =') and current_peer:
-                current_peer.keepalive = int(line.split('=', 1)[1].strip())
+                try:
+                    keepalive_val = line.split('=', 1)[1].strip()
+                    if keepalive_val.lower() not in ['every', 'off', 'none']:
+                        current_peer.keepalive = int(keepalive_val)
+                    else:
+                        current_peer.keepalive = 25
+                except (ValueError, IndexError):
+                    current_peer.keepalive = 25
                 peers.append(current_peer)
                 current_peer = None
         
