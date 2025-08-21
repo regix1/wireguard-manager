@@ -455,7 +455,104 @@ class WireGuardManagerApp:
             return
         
         # Display peers
-        table = Table(title="Select Peer", box=box.ROUNDED)
+        table = Table(title="Select Peer to View", box=box.ROUNDED)
+        table.add_column("#", style="cyan")
+        table.add_column("Name")
+        table.add_column("IP Address")
+        table.add_column("Type")
+        
+        for i, peer in enumerate(peers, 1):
+            peer_type = "Router" if peer.is_router else "Client"
+            table.add_row(str(i), peer.name, peer.ip_address, peer_type)
+        
+        self.console.print(table)
+        
+        choice = IntPrompt.ask("Select peer number (0 to cancel)", default=0)
+        if 0 < choice <= len(peers):
+            peer = peers[choice - 1]
+            
+            # Display peer details
+            self.console.print(f"\n[bold cyan]Peer Details: {peer.name}[/bold cyan]")
+            
+            details_table = Table(show_header=False, box=box.SIMPLE)
+            details_table.add_column("Property", style="cyan")
+            details_table.add_column("Value")
+            
+            details_table.add_row("Name", peer.name)
+            details_table.add_row("IP Address", peer.ip_address)
+            details_table.add_row("Type", "Router" if peer.is_router else "Client")
+            details_table.add_row("Public Key", peer.public_key if peer.public_key else "N/A")
+            details_table.add_row("Keepalive", f"{peer.keepalive} seconds")
+            
+            if peer.is_router and peer.routed_networks:
+                networks = "\n".join(peer.routed_networks)
+                details_table.add_row("Routed Networks", networks)
+            
+            self.console.print(details_table)
+            
+            # Display config file if exists
+            from pathlib import Path
+            from core.utils import sanitize_filename
+            
+            safe_name = sanitize_filename(peer.name)
+            config_dir = Path(self.settings.wireguard.config_dir) / "peers"
+            config_file = config_dir / f"{safe_name}.conf"
+            
+            if config_file.exists():
+                self.console.print(f"\n[bold cyan]Configuration File:[/bold cyan]")
+                config_text = config_file.read_text()
+                syntax = Syntax(config_text, "ini", theme="monokai", line_numbers=True)
+                self.console.print(Panel(syntax, title=f"{safe_name}.conf"))
+                
+                # Offer options
+                self.console.print("\n[cyan]Options:[/cyan]")
+                self.console.print("1. Generate QR code")
+                self.console.print("2. Copy to clipboard")
+                self.console.print("3. Save to file")
+                self.console.print("B. Back")
+                
+                option = Prompt.ask("Select option", choices=["1", "2", "3", "b", "B"], default="b").lower()
+                
+                if option == "1":
+                    # Generate QR code
+                    try:
+                        import qrcode
+                        qr = qrcode.QRCode(border=1)
+                        qr.add_data(config_text)
+                        qr.make(fit=True)
+                        self.console.print("\n[cyan]QR Code:[/cyan]")
+                        qr.print_ascii(invert=True)
+                    except:
+                        self.console.print("[yellow]QR code generation not available[/yellow]")
+                
+                elif option == "2":
+                    # Copy to clipboard
+                    try:
+                        import pyperclip
+                        pyperclip.copy(config_text)
+                        self.console.print("[green]✓[/green] Configuration copied to clipboard")
+                    except:
+                        self.console.print("[yellow]Clipboard not available[/yellow]")
+                        self.console.print("[dim]Install with: pip install pyperclip[/dim]")
+                
+                elif option == "3":
+                    # Save to file
+                    filename = Prompt.ask("Enter filename", default=f"{safe_name}.conf")
+                    Path(filename).write_text(config_text)
+                    self.console.print(f"[green]✓[/green] Saved to {filename}")
+                    
+            else:
+                self.console.print(f"[yellow]Config file not found at: {config_file}[/yellow]")
+    
+    def generate_qr_code(self):
+        """Generate QR code for peer config."""
+        peers = self.wg_manager.get_peers()
+        if not peers:
+            self.console.print("[yellow]No peers configured[/yellow]")
+            return
+        
+        # Display peers
+        table = Table(title="Select Peer for QR Code", box=box.ROUNDED)
         table.add_column("#", style="cyan")
         table.add_column("Name")
         table.add_column("IP Address")
@@ -468,7 +565,8 @@ class WireGuardManagerApp:
         choice = IntPrompt.ask("Select peer number (0 to cancel)", default=0)
         if 0 < choice <= len(peers):
             peer = peers[choice - 1]
-            # Display config
+            
+            # Get the peer's config file
             from pathlib import Path
             from core.utils import sanitize_filename
             
@@ -478,20 +576,110 @@ class WireGuardManagerApp:
             
             if config_file.exists():
                 config_text = config_file.read_text()
-                syntax = Syntax(config_text, "ini", theme="monokai", line_numbers=True)
-                self.console.print(Panel(syntax, title=f"Configuration for {peer.name}"))
+                
+                # Generate QR code
+                try:
+                    import qrcode
+                    
+                    self.console.print(f"\n[cyan]QR Code for {peer.name}:[/cyan]")
+                    self.console.print("[dim]Scan this with the WireGuard mobile app[/dim]\n")
+                    
+                    # Generate ASCII QR code for terminal display
+                    qr = qrcode.QRCode(border=1)
+                    qr.add_data(config_text)
+                    qr.make(fit=True)
+                    
+                    # Print ASCII version
+                    qr.print_ascii(invert=True)
+                    
+                    # Also save as image if possible
+                    try:
+                        img_qr = qrcode.QRCode(version=1, box_size=10, border=5)
+                        img_qr.add_data(config_text)
+                        img_qr.make(fit=True)
+                        img = img_qr.make_image(fill_color="black", back_color="white")
+                        
+                        qr_file = config_dir / f"{safe_name}_qr.png"
+                        img.save(str(qr_file))
+                        self.console.print(f"\n[green]✓[/green] QR code image saved to: {qr_file}")
+                    except Exception as e:
+                        self.console.print(f"[yellow]Could not save QR image: {e}[/yellow]")
+                    
+                except ImportError:
+                    self.console.print("[red]qrcode module not installed[/red]")
+                    self.console.print("Install with: pip install qrcode[pil]")
+                except Exception as e:
+                    self.console.print(f"[red]Error generating QR code: {e}[/red]")
             else:
-                self.console.print(f"[yellow]Config file not found for {peer.name}[/yellow]")
-    
-    def generate_qr_code(self):
-        """Generate QR code for peer config."""
-        self.console.print("[yellow]QR code generation will display in terminal[/yellow]")
-        # Implementation would use qrcode library to generate ASCII QR code
+                self.console.print(f"[yellow]Configuration file not found for {peer.name}[/yellow]")
+                self.console.print(f"Expected at: {config_file}")
     
     def export_configs(self):
         """Export all configurations."""
-        export_dir = Prompt.ask("Enter export directory", default="/tmp/wireguard-export")
-        self.console.print(f"[green]Configurations would be exported to {export_dir}[/green]")
+        from pathlib import Path
+        import shutil
+        from datetime import datetime
+        
+        # Get export directory from user
+        default_dir = f"/tmp/wireguard-export-{datetime.now():%Y%m%d-%H%M%S}"
+        export_dir = Prompt.ask("Enter export directory", default=default_dir)
+        
+        try:
+            # Create export directory
+            export_path = Path(export_dir)
+            export_path.mkdir(parents=True, exist_ok=True)
+            
+            # Export server config
+            if self.wg_manager.config_file.exists():
+                shutil.copy(self.wg_manager.config_file, export_path / "server-wg0.conf")
+                self.console.print(f"[green]✓[/green] Exported server config")
+            
+            # Export peer configs
+            peers_dir = Path(self.settings.wireguard.config_dir) / "peers"
+            if peers_dir.exists():
+                peer_count = 0
+                for config_file in peers_dir.glob("*.conf"):
+                    shutil.copy(config_file, export_path / config_file.name)
+                    peer_count += 1
+                
+                if peer_count > 0:
+                    self.console.print(f"[green]✓[/green] Exported {peer_count} peer configs")
+            
+            # Export firewall rules
+            firewall_rules = Path(self.settings.firewall.rules_file)
+            if firewall_rules.exists():
+                shutil.copy(firewall_rules, export_path / "firewall-rules.conf")
+                self.console.print(f"[green]✓[/green] Exported firewall rules")
+            
+            # Export settings
+            if self.settings.config_file.exists():
+                shutil.copy(self.settings.config_file, export_path / "settings.json")
+                self.console.print(f"[green]✓[/green] Exported settings")
+            
+            # Create README
+            readme_content = f"""WireGuard Manager Export
+========================
+Exported: {datetime.now():%Y-%m-%d %H:%M:%S}
+
+Contents:
+- server-wg0.conf: Main WireGuard server configuration
+- *.conf: Individual peer configurations
+- firewall-rules.conf: Firewall rules
+- settings.json: Application settings
+
+To restore:
+1. Copy server-wg0.conf to /etc/wireguard/wg0.conf
+2. Copy peer configs to /etc/wireguard/peers/
+3. Copy firewall-rules.conf to /etc/wireguard/
+4. Restart WireGuard: systemctl restart wg-quick@wg0
+"""
+            (export_path / "README.txt").write_text(readme_content)
+            
+            self.console.print(f"\n[green]✓[/green] All configurations exported to: {export_path}")
+            self.console.print("[dim]See README.txt in export directory for restore instructions[/dim]")
+            
+        except Exception as e:
+            self.console.print(f"[red]Export failed: {e}[/red]")
     
     def unban_ip(self):
         """Unban an IP address."""
