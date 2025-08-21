@@ -222,6 +222,7 @@ class WireGuardManagerApp:
                 dialog.show()
             elif choice == "5":
                 self.view_firewall_rules()
+                # No need for additional pause here as view_firewall_rules handles it
             elif choice == "b":
                 break
     
@@ -531,6 +532,9 @@ class WireGuardManagerApp:
             self.console.print(Panel(syntax, title="Firewall Rules"))
         else:
             self.console.print("[yellow]No rules file found[/yellow]")
+        
+        # Wait for user to read the rules
+        self.console.input("\n[dim]Press Enter to continue...[/dim]")
     
     def quick_add_peer(self):
         """Quick add peer with QR code."""
