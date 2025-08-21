@@ -314,18 +314,32 @@ class RulesEditorDialog:
         
         # Show current rules
         self.console.print(Panel("[bold]Firewall Rules Editor[/bold]", style="cyan"))
-        syntax = Syntax(current_rules, "bash", theme="monokai", line_numbers=True)
-        self.console.print(Panel(syntax, title="Current Rules"))
         
-        # Options
+        # Count rules for summary
+        rule_count = len([line for line in current_rules.split('\n') if line.strip() and line.strip().startswith('iptables')])
+        self.console.print(f"[cyan]Current rules file:[/cyan] {rules_file}")
+        self.console.print(f"[cyan]Total rules:[/cyan] {rule_count}")
+        self.console.print()
+        
+        # Show first 20 lines of rules
+        lines = current_rules.split('\n')[:20]
+        preview = '\n'.join(lines)
+        if len(current_rules.split('\n')) > 20:
+            preview += '\n[... more lines ...]'
+        
+        syntax = Syntax(preview, "bash", theme="monokai", line_numbers=True)
+        self.console.print(Panel(syntax, title="Rules Preview (first 20 lines)"))
+        
+        # Options with descriptions
         self.console.print("\n[bold cyan]Options:[/bold cyan]")
-        self.console.print("1. Edit rules in external editor")
-        self.console.print("2. Add custom rule")
-        self.console.print("3. Reset to defaults")
-        self.console.print("4. Validate rules")
-        self.console.print("B. Back")
+        self.console.print("1. Edit rules in external editor [dim](opens nano/vim)[/dim]")
+        self.console.print("2. Add custom rule [dim](add a new iptables rule)[/dim]")
+        self.console.print("3. Reset to defaults [dim](restore original rules)[/dim]")
+        self.console.print("4. Validate rules [dim](check for syntax errors)[/dim]")
+        self.console.print("5. Show full rules [dim](display all rules)[/dim]")
+        self.console.print("B. Back to firewall menu")
         
-        choice = Prompt.ask("Select option", choices=["1", "2", "3", "4", "b", "B"], default="b").lower()
+        choice = Prompt.ask("\nSelect option", choices=["1", "2", "3", "4", "5", "b", "B"], default="b").lower()
         
         if choice == "1":
             self._edit_in_editor(rules_file, current_rules)
@@ -335,6 +349,9 @@ class RulesEditorDialog:
             self._reset_to_defaults(rules_file)
         elif choice == "4":
             self._validate_rules(current_rules)
+            self.console.input("\n[dim]Press Enter to continue...[/dim]")
+        elif choice == "5":
+            self._show_full_rules(current_rules)
     
     def _get_default_template(self) -> str:
         """Get default rules template."""
@@ -365,6 +382,13 @@ iptables -A INPUT -i {self.fw_manager.settings.wireguard.interface_name} -p tcp 
 # Add your custom rules here
 """
     
+    def _show_full_rules(self, rules_text: str):
+        """Show full firewall rules."""
+        self.console.print("\n[bold cyan]Complete Firewall Rules:[/bold cyan]")
+        syntax = Syntax(rules_text, "bash", theme="monokai", line_numbers=True)
+        self.console.print(Panel(syntax, title="All Firewall Rules", expand=False))
+        self.console.input("\n[dim]Press Enter to continue...[/dim]")
+    
     def _edit_in_editor(self, rules_file: Path, current_rules: str):
         """Edit rules in external editor."""
         import tempfile
@@ -374,6 +398,9 @@ iptables -A INPUT -i {self.fw_manager.settings.wireguard.interface_name} -p tcp 
         # Determine editor
         editor = os.environ.get('EDITOR', 'nano')
         
+        self.console.print(f"\n[cyan]Opening rules in {editor}...[/cyan]")
+        self.console.print("[dim]Tip: Use Ctrl+O to save, Ctrl+X to exit in nano[/dim]")
+        
         # Create temp file
         with tempfile.NamedTemporaryFile(mode='w', suffix='.conf', delete=False) as f:
             f.write(current_rules)
@@ -381,20 +408,42 @@ iptables -A INPUT -i {self.fw_manager.settings.wireguard.interface_name} -p tcp 
         
         try:
             # Open in editor
-            self.console.print(f"\n[cyan]Opening rules in {editor}...[/cyan]")
             subprocess.call([editor, temp_file])
             
             # Read edited content
             with open(temp_file, 'r') as f:
                 new_rules = f.read()
             
+            # Check if changed
+            if new_rules == current_rules:
+                self.console.print("\n[yellow]No changes made[/yellow]")
+                return
+            
+            # Show what changed
+            lines_before = len(current_rules.split('\n'))
+            lines_after = len(new_rules.split('\n'))
+            self.console.print(f"\n[cyan]Changes detected:[/cyan]")
+            self.console.print(f"  Lines: {lines_before} → {lines_after}")
+            
             # Validate
             if self._validate_rules(new_rules):
-                if Confirm.ask("Save changes?", default=True):
+                if Confirm.ask("\nSave changes?", default=True):
                     rules_file.parent.mkdir(parents=True, exist_ok=True)
                     rules_file.write_text(new_rules)
                     self.console.print("[green]✓[/green] Rules saved successfully")
                     self.console.print("[yellow]Note: Restart the firewall to apply changes[/yellow]")
+                    
+                    if Confirm.ask("Restart firewall now?", default=False):
+                        self.console.print("Restarting firewall...")
+                        try:
+                            self.fw_manager.restart()
+                            self.console.print("[green]✓[/green] Firewall restarted")
+                        except Exception as e:
+                            self.console.print(f"[red]Failed to restart: {e}[/red]")
+            else:
+                if Confirm.ask("\n[yellow]Rules have issues. Save anyway?[/yellow]", default=False):
+                    rules_file.write_text(new_rules)
+                    self.console.print("[yellow]⚠[/yellow] Rules saved with warnings")
         finally:
             # Clean up temp file
             if os.path.exists(temp_file):
@@ -514,29 +563,122 @@ iptables -A INPUT -i {self.fw_manager.settings.wireguard.interface_name} -p tcp 
     
     def _reset_to_defaults(self, rules_file: Path):
         """Reset rules to defaults."""
-        if Confirm.ask("Reset all rules to defaults? This cannot be undone.", default=False):
-            default_rules = self._get_default_template()
+        default_rules = self._get_default_template()
+        
+        # Show what will be reset
+        self.console.print("\n[yellow bold]Warning![/yellow bold]")
+        self.console.print("This will replace ALL current firewall rules with defaults.")
+        self.console.print("\n[cyan]Default configuration includes:[/cyan]")
+        self.console.print("  • NAT/Masquerade for WireGuard subnet")
+        self.console.print("  • WireGuard port access")
+        self.console.print("  • Basic forwarding rules")
+        self.console.print("  • DNS access for VPN clients")
+        self.console.print("\n[red]All custom rules and port forwards will be LOST![/red]")
+        
+        if Confirm.ask("\nAre you sure you want to reset to defaults?", default=False):
+            # Backup current rules
+            from datetime import datetime
+            backup_file = rules_file.parent / f"rules.backup.{datetime.now():%Y%m%d-%H%M%S}"
+            if rules_file.exists():
+                import shutil
+                shutil.copy(rules_file, backup_file)
+                self.console.print(f"[dim]Current rules backed up to: {backup_file}[/dim]")
+            
+            # Write defaults
             rules_file.parent.mkdir(parents=True, exist_ok=True)
             rules_file.write_text(default_rules)
+            
             self.console.print("[green]✓[/green] Rules reset to defaults")
             self.console.print("[yellow]Note: Restart the firewall to apply changes[/yellow]")
+            
+            if Confirm.ask("Restart firewall now?", default=True):
+                self.console.print("Restarting firewall...")
+                try:
+                    self.fw_manager.restart()
+                    self.console.print("[green]✓[/green] Firewall restarted with default rules")
+                except Exception as e:
+                    self.console.print(f"[red]Failed to restart: {e}[/red]")
+        else:
+            self.console.print("[dim]Reset cancelled[/dim]")
     
     def _validate_rules(self, rules_text: str) -> bool:
         """Validate firewall rules."""
+        self.console.print("\n[cyan]Validating firewall rules...[/cyan]")
+        
         errors = []
+        warnings = []
+        line_count = 0
+        rule_count = 0
         
         for i, line in enumerate(rules_text.split('\n'), 1):
+            line_count += 1
             line = line.strip()
-            if line and not line.startswith('#'):
-                if not line.startswith('iptables'):
-                    errors.append(f"Line {i}: Must start with 'iptables'")
-                # Could add more validation here
+            
+            # Skip empty lines and comments
+            if not line or line.startswith('#'):
+                continue
+            
+            # Check if it's an iptables command
+            if not line.startswith('iptables'):
+                errors.append(f"Line {i}: Command must start with 'iptables' - found: {line[:50]}")
+                continue
+            
+            rule_count += 1
+            
+            # Check for common issues
+            if '-j' not in line and '-g' not in line:
+                warnings.append(f"Line {i}: No jump target (-j) specified")
+            
+            if '--dport' in line and '-p' not in line:
+                errors.append(f"Line {i}: --dport requires protocol (-p tcp/udp)")
+            
+            if '--sport' in line and '-p' not in line:
+                errors.append(f"Line {i}: --sport requires protocol (-p tcp/udp)")
+            
+            # Check for valid chains
+            valid_chains = ['INPUT', 'OUTPUT', 'FORWARD', 'PREROUTING', 'POSTROUTING']
+            parts = line.split()
+            if '-A' in parts or '-I' in parts or '-D' in parts:
+                idx = parts.index('-A') if '-A' in parts else parts.index('-I') if '-I' in parts else parts.index('-D')
+                if idx + 1 < len(parts):
+                    chain = parts[idx + 1]
+                    if chain not in valid_chains and not chain.startswith('DOCKER'):
+                        warnings.append(f"Line {i}: Unusual chain name '{chain}'")
+            
+            # Check for valid targets
+            valid_targets = ['ACCEPT', 'DROP', 'REJECT', 'LOG', 'MASQUERADE', 'SNAT', 'DNAT', 'RETURN']
+            if '-j' in parts:
+                idx = parts.index('-j')
+                if idx + 1 < len(parts):
+                    target = parts[idx + 1]
+                    if target not in valid_targets and not target.startswith('DOCKER'):
+                        warnings.append(f"Line {i}: Unusual target '{target}'")
+        
+        # Display results
+        self.console.print(f"\n[bold]Validation Results:[/bold]")
+        self.console.print(f"  Total lines: {line_count}")
+        self.console.print(f"  Rules found: {rule_count}")
         
         if errors:
-            self.console.print("[red]Validation errors found:[/red]")
+            self.console.print(f"\n[red bold]Errors ({len(errors)}):[/red bold]")
             for error in errors[:10]:  # Show first 10 errors
-                self.console.print(f"  • {error}")
-            return False
-        else:
-            self.console.print("[green]✓[/green] Rules are valid")
+                self.console.print(f"  [red]✗[/red] {error}")
+            if len(errors) > 10:
+                self.console.print(f"  [dim]... and {len(errors) - 10} more errors[/dim]")
+            
+        if warnings:
+            self.console.print(f"\n[yellow bold]Warnings ({len(warnings)}):[/yellow bold]")
+            for warning in warnings[:5]:  # Show first 5 warnings
+                self.console.print(f"  [yellow]![/yellow] {warning}")
+            if len(warnings) > 5:
+                self.console.print(f"  [dim]... and {len(warnings) - 5} more warnings[/dim]")
+        
+        if not errors and not warnings:
+            self.console.print("\n[green]✓[/green] All rules appear to be valid!")
             return True
+        elif not errors:
+            self.console.print("\n[yellow]⚠[/yellow] Rules have warnings but no critical errors.")
+            return True
+        else:
+            self.console.print("\n[red]✗[/red] Rules have errors that should be fixed.")
+            return False
