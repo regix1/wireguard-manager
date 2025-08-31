@@ -48,13 +48,42 @@ fi
 echo "Creating installation directory..."
 mkdir -p "$INSTALL_DIR"
 
+# Create data directory if it doesn't exist
+if [ ! -d "data" ]; then
+    echo "Creating data directory..."
+    mkdir -p data
+    
+    # Create defaults.json if it doesn't exist
+    cat > data/defaults.json << 'EOF'
+{
+  "default_port": "51820",
+  "default_subnet": "10.10.20.0/24",
+  "default_peer_ip": "10.10.20.2",
+  "default_endpoint": "YOUR_SERVER_IP",
+  "dns_servers": "1.1.1.1, 1.0.0.1",
+  "keepalive": 25,
+  "interface": "wg0",
+  "external_interface": "eth0"
+}
+EOF
+fi
+
 # Copy files
 echo "Copying files..."
-cp -r src templates data VERSION requirements.txt run.py "$INSTALL_DIR/"
+for item in src templates data VERSION requirements.txt run.py; do
+    if [ -e "$item" ]; then
+        cp -r "$item" "$INSTALL_DIR/"
+    else
+        echo -e "${YELLOW}Warning: $item not found, skipping...${NC}"
+    fi
+done
 
 # Install Python dependencies
 echo "Installing Python dependencies..."
-pip3 install -r "$INSTALL_DIR/requirements.txt" >/dev/null 2>&1
+pip3 install -r "$INSTALL_DIR/requirements.txt" >/dev/null 2>&1 || {
+    echo -e "${YELLOW}Warning: Some Python packages may not have installed correctly${NC}"
+    echo "You can install them manually with: pip3 install -r $INSTALL_DIR/requirements.txt"
+}
 
 # Create executable
 echo "Creating system command..."
