@@ -15,7 +15,8 @@ with open(version_file, "r", encoding="utf-8") as f:
 # Read requirements
 requirements_file = here / "requirements.txt"
 with open(requirements_file, "r", encoding="utf-8") as f:
-    requirements = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+    requirements = [line.strip() for line in f if line.strip()
+                    and not line.startswith("#")]
 
 # Read README for long description
 readme_file = here / "README.md"
