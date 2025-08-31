@@ -3,6 +3,7 @@
 import sys
 import termios
 import tty
+import time
 from typing import List, Optional, Callable, Any
 from dataclasses import dataclass
 from rich.console import Console
@@ -51,30 +52,49 @@ class InteractiveMenu:
         """Add a category of items."""
         self.items.append(category)
     
+    def flush_input(self) -> None:
+        """Flush any pending input from stdin."""
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(sys.stdin.fileno())
+            termios.tcflush(fd, termios.TCIFLUSH)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    
     def get_key(self) -> str:
         """Get a single keypress from the user."""
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
         try:
             tty.setraw(sys.stdin.fileno())
+            
+            # Add small delay to avoid catching buffered input
+            time.sleep(0.05)
+            
             key = sys.stdin.read(1)
             
             if key == '\x1b':  # ESC sequence
-                next_chars = sys.stdin.read(2)
-                if next_chars == '[A':
-                    return 'UP'
-                elif next_chars == '[B':
-                    return 'DOWN'
-                elif next_chars == '[C':
-                    return 'RIGHT'
-                elif next_chars == '[D':
-                    return 'LEFT'
-                else:
-                    return 'ESC'
+                # Check if there are more characters (arrow keys)
+                # Use timeout to avoid blocking
+                import select
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    next_chars = sys.stdin.read(2)
+                    if next_chars == '[A':
+                        return 'UP'
+                    elif next_chars == '[B':
+                        return 'DOWN'
+                    elif next_chars == '[C':
+                        return 'RIGHT'
+                    elif next_chars == '[D':
+                        return 'LEFT'
+                return 'ESC'
             elif key == '\r' or key == '\n':
                 return 'ENTER'
             elif key == '\x03':  # Ctrl+C
                 raise KeyboardInterrupt
+            elif key == '\x04':  # Ctrl+D
+                return 'EXIT'
             else:
                 return key
         finally:
@@ -178,6 +198,12 @@ class InteractiveMenu:
     
     def run(self) -> Any:
         """Run the interactive menu loop."""
+        # Flush any buffered input before starting
+        self.flush_input()
+        
+        # Small delay to ensure clean start
+        time.sleep(0.1)
+        
         while True:
             self.display_menu()
             
@@ -196,6 +222,26 @@ class InteractiveMenu:
                     self.current_index = 0
                 elif key == 'q' or key == 'Q':
                     return False
+                elif key == 'EXIT':  # Ctrl+D
+                    return False
+                elif key == 'x' or key == 'X':  # Alternative exit
+                    return False
+                elif key == 'h' or key == 'H':  # Help shortcut
+                    # Find and execute help item
+                    visible_items = self._get_visible_items()
+                    for idx, (item, _, _) in enumerate(visible_items):
+                        if isinstance(item, MenuItem) and item.key == 'h':
+                            self.current_index = idx
+                            self.handle_selection()
+                            break
+                elif key == 's' or key == 'S':  # Service status shortcut
+                    # Find and execute service status item
+                    visible_items = self._get_visible_items()
+                    for idx, (item, _, _) in enumerate(visible_items):
+                        if isinstance(item, MenuItem) and item.key == 's':
+                            self.current_index = idx
+                            self.handle_selection()
+                            break
                 elif key.isdigit() and key != '0':
                     num = int(key)
                     visible_items = self._get_visible_items()
@@ -209,3 +255,5 @@ class InteractiveMenu:
                 console.print("\n\n[yellow]Use 'q' to quit or ESC to go back[/yellow]")
                 console.print("[dim]Press Enter to continue...[/dim]")
                 input()
+                # Flush input after interrupt
+                self.flush_input()

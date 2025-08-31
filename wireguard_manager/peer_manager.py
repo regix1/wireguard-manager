@@ -255,9 +255,32 @@ class PeerManager:
     def _get_interfaces(self) -> List[str]:
         """Get list of WireGuard interfaces."""
         interfaces = []
+        
+        # Skip patterns for non-interface config files
+        skip_patterns = [
+            'firewall', 'rules', 'backup', 'peer_', 
+            'client', 'server_peer', 'banned', 'params'
+        ]
+        
         for conf_file in WIREGUARD_DIR.glob("*.conf"):
-            if not conf_file.stem.startswith("peer_"):
-                interfaces.append(conf_file.stem)
+            filename = conf_file.stem
+            
+            # Skip non-WireGuard config files
+            if any(pattern in filename.lower() for pattern in skip_patterns):
+                continue
+            
+            # Skip backup files
+            if filename.endswith('.bak') or filename.endswith('.old') or filename.endswith('.snat'):
+                continue
+            
+            # Check if file contains [Interface] section
+            try:
+                content = conf_file.read_text()
+                if '[Interface]' in content:
+                    interfaces.append(filename)
+            except Exception:
+                continue
+                
         return sorted(interfaces)
     
     def _get_server_public_key(self, interface: str) -> Optional[str]:

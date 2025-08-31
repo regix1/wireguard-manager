@@ -5,6 +5,7 @@ from typing import List, Dict, Optional
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
+import re
 
 from .constants import WIREGUARD_DIR
 from .utils import run_command, check_service_status
@@ -19,8 +20,33 @@ class ServiceManager:
         interfaces = []
         if WIREGUARD_DIR.exists():
             for conf_file in WIREGUARD_DIR.glob("*.conf"):
-                if not conf_file.stem.startswith("peer_"):
-                    interfaces.append(conf_file.stem)
+                # Only match WireGuard interface patterns: wg0, wg1, etc.
+                # or any name that doesn't contain special keywords
+                filename = conf_file.stem
+                
+                # Skip non-WireGuard config files
+                skip_patterns = [
+                    'firewall', 'rules', 'backup', 'peer_', 
+                    'client', 'server_peer', 'banned', 'params'
+                ]
+                
+                if any(pattern in filename.lower() for pattern in skip_patterns):
+                    continue
+                
+                # Also skip files that are clearly not interfaces
+                if filename.endswith('.bak') or filename.endswith('.old'):
+                    continue
+                    
+                # Check if it looks like a WireGuard interface config
+                # by checking if the file contains [Interface] section
+                try:
+                    content = conf_file.read_text()
+                    if '[Interface]' in content:
+                        interfaces.append(filename)
+                except Exception:
+                    # If we can't read the file, skip it
+                    continue
+                    
         return sorted(interfaces)
     
     def get_active_interfaces(self) -> List[str]:

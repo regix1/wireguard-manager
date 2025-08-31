@@ -185,8 +185,8 @@ PostDown = iptables -t nat -D POSTROUTING -o {{ external_interface }} -j MASQUER
         console.print(f"\n[green]✓[/green] Server configuration created: {config_file}")
         console.print(f"[green]✓[/green] Server public key: {public_key}")
         console.print("\n[yellow]Next steps:[/yellow]")
-        console.print("  1. Start the interface: systemctl start wg-quick@{interface}")
-        console.print("  2. Enable on boot: systemctl enable wg-quick@{interface}")
+        console.print(f"  1. Start the interface: systemctl start wg-quick@{interface}")
+        console.print(f"  2. Enable on boot: systemctl enable wg-quick@{interface}")
         console.print("  3. Add peers using the Peer Management menu")
     
     def _get_server_template(self) -> str:
@@ -211,13 +211,37 @@ PostDown = iptables -t nat -D POSTROUTING -o {{ external_interface }} -j MASQUER
             border_style="cyan"
         ))
         
-        # List available configurations
-        configs = list(WIREGUARD_DIR.glob("*.conf"))
+        # List available configurations - filter properly
+        configs = []
+        skip_patterns = [
+            'firewall', 'rules', 'backup', 'peer_', 
+            'client', 'server_peer', 'banned', 'params'
+        ]
+        
+        for conf_file in WIREGUARD_DIR.glob("*.conf"):
+            filename = conf_file.stem
+            
+            # Skip non-WireGuard config files
+            if any(pattern in filename.lower() for pattern in skip_patterns):
+                continue
+            
+            # Skip backup files
+            if filename.endswith('.bak') or filename.endswith('.old') or filename.endswith('.snat'):
+                continue
+            
+            # Check if file contains [Interface] section
+            try:
+                content = conf_file.read_text()
+                if '[Interface]' in content:
+                    configs.append(conf_file)
+            except Exception:
+                continue
+        
         if not configs:
-            console.print("[yellow]No configurations found[/yellow]")
+            console.print("[yellow]No WireGuard configurations found[/yellow]")
             return
         
-        console.print("[cyan]Available configurations:[/cyan]")
+        console.print("[cyan]Available WireGuard configurations:[/cyan]")
         for i, config in enumerate(configs, 1):
             console.print(f"  {i}. {config.stem}")
         
@@ -248,7 +272,7 @@ PostDown = iptables -t nat -D POSTROUTING -o {{ external_interface }} -j MASQUER
         console.print("─" * 60)
         
         console.print("\n[yellow]Note: Direct file editing not implemented in this demo[/yellow]")
-        console.print("Use 'sudo nano {config_file}' to edit manually")
+        console.print(f"Use 'sudo nano {config_file}' to edit manually")
     
     def edit_network_settings(self) -> None:
         """Edit network settings."""
