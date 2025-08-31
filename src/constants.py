@@ -9,6 +9,7 @@ def get_app_version():
     version_paths = [
         Path(__file__).parent.parent / "VERSION",
         Path.home() / "wireguard-manager" / "VERSION",
+        Path("/etc/wireguard/wireguard-manager/VERSION"),
     ]
     
     for version_path in version_paths:
@@ -23,6 +24,7 @@ def load_defaults():
         Path(__file__).parent.parent / "data" / "defaults.json",
         Path.home() / "wireguard-manager" / "data" / "defaults.json",
         Path("/opt/wireguard-manager/data/defaults.json"),
+        Path("/etc/wireguard/wireguard-manager/data/defaults.json"),
         Path("/etc/wireguard/defaults.json"),
     ]
     

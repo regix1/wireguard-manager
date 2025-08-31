@@ -4,53 +4,56 @@
 from setuptools import setup, find_packages
 from pathlib import Path
 
-# Get the directory containing this file
-here = Path(__file__).parent
+# Read the VERSION file
+version_file = Path(__file__).parent / "VERSION"
+if version_file.exists():
+    version = version_file.read_text().strip()
+else:
+    version = "2.0.0"
 
-# Read version
-version_file = here / "VERSION"
-with open(version_file, "r", encoding="utf-8") as f:
-    version = f.read().strip()
-
-# Read requirements
-requirements_file = here / "requirements.txt"
-with open(requirements_file, "r", encoding="utf-8") as f:
-    requirements = [line.strip() for line in f if line.strip()
-                    and not line.startswith("#")]
-    
-readme_file = here / "README.md"
-try:
-    with open(readme_file, "r", encoding="utf-8") as f:
-        long_description = f.read()
-except FileNotFoundError:
-    long_description = "A modern WireGuard VPN management tool"
+# Read the README file
+readme_file = Path(__file__).parent / "README.md"
+if readme_file.exists():
+    long_description = readme_file.read_text()
+else:
+    long_description = "WireGuard Manager - A modern VPN management tool"
 
 setup(
     name="wireguard-manager",
     version=version,
     author="Regix",
-    description="A modern WireGuard VPN management tool",
+    author_email="",
+    description="A comprehensive WireGuard VPN management tool",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    packages=find_packages(),
-    install_requires=requirements,
+    url="https://github.com/regix1/wireguard-manager",
+    packages=["src"],
+    package_dir={"src": "src"},
+    classifiers=[
+        "Programming Language :: Python :: 3",
+        "License :: OSI Approved :: MIT License",
+        "Operating System :: POSIX :: Linux",
+        "Environment :: Console",
+        "Intended Audience :: System Administrators",
+        "Topic :: System :: Networking",
+    ],
+    python_requires=">=3.6",
+    install_requires=[
+        "rich>=13.7.0",
+        "jinja2>=3.1.2",
+        "pyyaml>=6.0",
+        "psutil>=5.9.0",
+        "requests>=2.31.0",
+        "qrcode[pil]>=7.4.2",
+    ],
     entry_points={
         "console_scripts": [
-            "wg-manager=wireguard_manager.cli:main",
+            "wg-manager=src.cli:main",
+            "wireguard-manager=src.cli:main",
         ],
     },
     include_package_data=True,
     package_data={
-        "wireguard_manager": ["../data/**/*"],
+        "src": ["../data/templates/*.j2", "../data/*.json"],
     },
-    python_requires=">=3.8",
-    classifiers=[
-        "Development Status :: 4 - Beta",
-        "Operating System :: POSIX :: Linux",
-        "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.8",
-        "Programming Language :: Python :: 3.9",
-        "Programming Language :: Python :: 3.10",
-        "Programming Language :: Python :: 3.11",
-    ],
 )

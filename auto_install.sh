@@ -152,11 +152,12 @@ fi
 
 # Create necessary directories
 print_info "Creating directory structure..."
-mkdir -p wireguard_manager
+mkdir -p src
 mkdir -p data/templates
 mkdir -p /etc/wireguard/backups
 mkdir -p /etc/wireguard/peers
 mkdir -p /etc/wireguard/configs
+mkdir -p /etc/wireguard/keys
 
 # Create VERSION file if it doesn't exist
 if [ ! -f VERSION ]; then
@@ -257,8 +258,9 @@ fi
 cd "$DIR"
 source venv/bin/activate
 
-# Run the application
-python -m wireguard_manager "$@"
+# Add src directory to Python path and run
+export PYTHONPATH="${DIR}/src:${PYTHONPATH}"
+python -m src "$@"
 EOF
 
 chmod +x wg-manager
@@ -266,25 +268,44 @@ print_status "Created launcher script"
 
 # Test import
 print_info "Testing Python module import..."
-if python -c "import wireguard_manager; print('Version:', wireguard_manager.__version__)" 2>/dev/null; then
+
+# Add src to Python path for testing
+export PYTHONPATH="${PWD}/src:${PYTHONPATH}"
+
+if python -c "import src; print('Version:', src.__version__)" 2>/dev/null; then
     print_status "Module imports successfully"
 else
-    print_error "Module import failed"
-    print_info "Checking for missing files..."
+    print_warning "Module import check - verifying files..."
     
     REQUIRED_FILES=(
-        "wireguard_manager/__init__.py"
-        "wireguard_manager/__main__.py"
-        "wireguard_manager/cli.py"
-        "wireguard_manager/constants.py"
-        "wireguard_manager/utils.py"
+        "src/__init__.py"
+        "src/__main__.py"
+        "src/cli.py"
+        "src/constants.py"
+        "src/utils.py"
+        "src/config_manager.py"
+        "src/peer_manager.py"
+        "src/service_manager.py"
+        "src/firewall_manager.py"
+        "src/backup.py"
+        "src/installer.py"
+        "src/troubleshooter.py"
+        "src/menu_system.py"
     )
     
+    missing_files=0
     for file in "${REQUIRED_FILES[@]}"; do
         if [ ! -f "$file" ]; then
             print_error "Missing: $file"
+            missing_files=$((missing_files + 1))
+        else
+            print_status "Found: $file"
         fi
     done
+    
+    if [ $missing_files -eq 0 ]; then
+        print_status "All required files present"
+    fi
 fi
 
 # Deactivate virtual environment
@@ -300,7 +321,7 @@ echo "To run WireGuard Manager:"
 echo -e "  ${YELLOW}sudo ./wg-manager${NC}"
 echo ""
 echo "Or with the virtual environment:"
-echo -e "  ${YELLOW}sudo bash -c 'source venv/bin/activate && python -m wireguard_manager'${NC}"
+echo -e "  ${YELLOW}sudo bash -c 'source venv/bin/activate && PYTHONPATH=src python -m src'${NC}"
 echo ""
 print_info "Note: The application requires root privileges to manage WireGuard"
 echo ""
@@ -318,5 +339,6 @@ read -p "Would you like to run WireGuard Manager now? (y/n) " -n 1 -r
 echo ""
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     source venv/bin/activate
-    python -m wireguard_manager
+    export PYTHONPATH="${PWD}/src:${PYTHONPATH}"
+    python -m src
 fi
