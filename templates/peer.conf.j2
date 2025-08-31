@@ -1,0 +1,12 @@
+[Interface]
+# Name: {{ peer_name }}
+PrivateKey = {{ private_key }}
+Address = {{ address }}
+DNS = {{ dns }}
+
+[Peer]
+PublicKey = {{ server_public_key }}
+PresharedKey = {{ preshared_key }}
+AllowedIPs = 0.0.0.0/0
+Endpoint = {{ endpoint }}
+PersistentKeepalive = {{ keepalive }}
