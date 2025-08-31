@@ -1,9 +1,10 @@
 """Interactive menu system for CLI navigation."""
 
 import sys
+import os
 import termios
 import tty
-import time
+import select
 from typing import List, Optional, Callable, Any
 from dataclasses import dataclass
 from rich.console import Console
@@ -43,6 +44,8 @@ class InteractiveMenu:
         """Initialize the interactive menu."""
         self.items: List[Any] = []
         self.current_index = 0
+        self.fd = sys.stdin.fileno()
+        self.old_settings = None
     
     def add_item(self, item: MenuItem) -> None:
         """Add a top-level menu item."""
@@ -52,56 +55,60 @@ class InteractiveMenu:
         """Add a category of items."""
         self.items.append(category)
     
-    def flush_input(self) -> None:
-        """Flush any pending input from stdin."""
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-        try:
-            tty.setraw(sys.stdin.fileno())
-            termios.tcflush(fd, termios.TCIFLUSH)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    def setup_terminal(self) -> None:
+        """Setup terminal for raw input."""
+        self.old_settings = termios.tcgetattr(self.fd)
+        tty.setraw(self.fd)
     
-    def get_key(self) -> str:
-        """Get a single keypress from the user."""
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
+    def restore_terminal(self) -> None:
+        """Restore terminal to original settings."""
+        if self.old_settings:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
+    
+    def getch(self) -> str:
+        """Get a single character from input."""
         try:
-            tty.setraw(sys.stdin.fileno())
+            # Setup terminal for this read
+            self.setup_terminal()
             
-            # Add small delay to avoid catching buffered input
-            time.sleep(0.05)
+            ch = sys.stdin.read(1)
             
-            key = sys.stdin.read(1)
-            
-            if key == '\x1b':  # ESC sequence
-                # Check if there are more characters (arrow keys)
-                # Use timeout to avoid blocking
-                import select
-                if select.select([sys.stdin], [], [], 0.1)[0]:
-                    next_chars = sys.stdin.read(2)
-                    if next_chars == '[A':
+            # Handle special keys
+            if ch == '\x1b':  # ESC
+                # Check if more characters are available (arrow key sequence)
+                if select.select([sys.stdin], [], [], 0.001)[0]:
+                    ch += sys.stdin.read(2)
+                    if ch == '\x1b[A':  # Up arrow
                         return 'UP'
-                    elif next_chars == '[B':
+                    elif ch == '\x1b[B':  # Down arrow
                         return 'DOWN'
-                    elif next_chars == '[C':
+                    elif ch == '\x1b[C':  # Right arrow
                         return 'RIGHT'
-                    elif next_chars == '[D':
+                    elif ch == '\x1b[D':  # Left arrow
                         return 'LEFT'
+                    elif ch == '\x1bOH':  # Home
+                        return 'HOME'
+                    elif ch == '\x1bOF':  # End
+                        return 'END'
                 return 'ESC'
-            elif key == '\r' or key == '\n':
+            elif ch == '\r' or ch == '\n':
                 return 'ENTER'
-            elif key == '\x03':  # Ctrl+C
+            elif ch == ' ':
+                return 'SPACE'
+            elif ch == '\x03':  # Ctrl+C
                 raise KeyboardInterrupt
-            elif key == '\x04':  # Ctrl+D
+            elif ch == '\x04':  # Ctrl+D
                 return 'EXIT'
             else:
-                return key
+                return ch
         finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            # Always restore terminal
+            self.restore_terminal()
     
     def display_menu(self) -> None:
         """Display the current menu state."""
+        # Save cursor position and clear screen
+        console.print("\033[?25l", end="")  # Hide cursor
         console.clear()
         
         # Header
@@ -141,6 +148,9 @@ class InteractiveMenu:
                 else:
                     display_text = f"{item.prefix} {item.name}" if item.prefix else item.name
                     console.print(f"{indent}[{item.style}]  {display_text}[/{item.style}]")
+        
+        # Show cursor again
+        console.print("\033[?25h", end="")
     
     def _get_visible_items(self) -> List[tuple]:
         """Get list of currently visible items with their metadata."""
@@ -170,7 +180,9 @@ class InteractiveMenu:
             current_item.expanded = not current_item.expanded
             return None
         elif isinstance(current_item, MenuItem):
+            # Restore terminal before running action
             console.clear()
+            console.print("\033[?25h")  # Show cursor
             try:
                 result = current_item.action()
                 return result
@@ -198,62 +210,89 @@ class InteractiveMenu:
     
     def run(self) -> Any:
         """Run the interactive menu loop."""
-        # Flush any buffered input before starting
-        self.flush_input()
-        
-        # Small delay to ensure clean start
-        time.sleep(0.1)
-        
-        while True:
-            self.display_menu()
-            
-            try:
-                key = self.get_key()
+        try:
+            while True:
+                self.display_menu()
                 
-                if key == 'UP' or key == 'k':
-                    self.navigate_up()
-                elif key == 'DOWN' or key == 'j':
-                    self.navigate_down()
-                elif key == 'ENTER' or key == ' ':
-                    result = self.handle_selection()
-                    if result is False:
-                        return False
-                elif key == 'ESC' or key == 'b':
-                    self.current_index = 0
-                elif key == 'q' or key == 'Q':
-                    return False
-                elif key == 'EXIT':  # Ctrl+D
-                    return False
-                elif key == 'x' or key == 'X':  # Alternative exit
-                    return False
-                elif key == 'h' or key == 'H':  # Help shortcut
-                    # Find and execute help item
-                    visible_items = self._get_visible_items()
-                    for idx, (item, _, _) in enumerate(visible_items):
-                        if isinstance(item, MenuItem) and item.key == 'h':
-                            self.current_index = idx
-                            self.handle_selection()
-                            break
-                elif key == 's' or key == 'S':  # Service status shortcut
-                    # Find and execute service status item
-                    visible_items = self._get_visible_items()
-                    for idx, (item, _, _) in enumerate(visible_items):
-                        if isinstance(item, MenuItem) and item.key == 's':
-                            self.current_index = idx
-                            self.handle_selection()
-                            break
-                elif key.isdigit() and key != '0':
-                    num = int(key)
-                    visible_items = self._get_visible_items()
-                    if num <= len(visible_items):
-                        self.current_index = num - 1
+                try:
+                    key = self.getch()
+                    
+                    # Handle navigation
+                    if key == 'UP' or key == 'k':
+                        self.navigate_up()
+                    elif key == 'DOWN' or key == 'j':
+                        self.navigate_down()
+                    elif key in ['ENTER', 'SPACE', 'RIGHT']:
                         result = self.handle_selection()
                         if result is False:
-                            return False
-                    
-            except KeyboardInterrupt:
-                console.print("\n\n[yellow]Use 'q' to quit or ESC to go back[/yellow]")
-                console.print("[dim]Press Enter to continue...[/dim]")
-                input()
-                # Flush input after interrupt
-                self.flush_input()
+                            break
+                    elif key in ['ESC', 'LEFT', 'b']:
+                        # Collapse current category or go back
+                        visible_items = self._get_visible_items()
+                        if self.current_index < len(visible_items):
+                            current_item, is_category, parent_idx = visible_items[self.current_index]
+                            if isinstance(current_item, MenuCategory) and current_item.expanded:
+                                current_item.expanded = False
+                            elif parent_idx is not None:
+                                # Jump to parent category
+                                self.current_index = 0
+                                for idx, (item, _, _) in enumerate(visible_items):
+                                    if isinstance(item, MenuCategory):
+                                        self.current_index = idx
+                                        break
+                    elif key in ['q', 'Q', 'EXIT']:
+                        break
+                    elif key in ['x', 'X']:
+                        # Find exit item
+                        visible_items = self._get_visible_items()
+                        for idx, (item, _, _) in enumerate(visible_items):
+                            if isinstance(item, MenuItem) and item.key == 'x':
+                                self.current_index = idx
+                                result = self.handle_selection()
+                                if result is False:
+                                    break
+                    elif key in ['h', 'H']:
+                        # Find help item
+                        visible_items = self._get_visible_items()
+                        for idx, (item, _, _) in enumerate(visible_items):
+                            if isinstance(item, MenuItem) and item.key == 'h':
+                                self.current_index = idx
+                                self.handle_selection()
+                                break
+                    elif key in ['s', 'S']:
+                        # Find service status item
+                        visible_items = self._get_visible_items()
+                        for idx, (item, _, _) in enumerate(visible_items):
+                            if isinstance(item, MenuItem) and item.key == 's':
+                                self.current_index = idx
+                                self.handle_selection()
+                                break
+                    elif key == 'HOME':
+                        self.current_index = 0
+                    elif key == 'END':
+                        visible_items = self._get_visible_items()
+                        self.current_index = len(visible_items) - 1
+                    elif key.isdigit() and key != '0':
+                        # Quick jump to item
+                        num = int(key)
+                        visible_items = self._get_visible_items()
+                        if num <= len(visible_items):
+                            self.current_index = num - 1
+                            result = self.handle_selection()
+                            if result is False:
+                                break
+                        
+                except KeyboardInterrupt:
+                    console.print("\033[?25h")  # Show cursor
+                    console.print("\n\n[yellow]Use 'q' to quit or ESC to go back[/yellow]")
+                    console.print("[dim]Press Enter to continue...[/dim]")
+                    try:
+                        input()
+                    except:
+                        pass
+        finally:
+            # Ensure terminal is restored and cursor is visible
+            console.print("\033[?25h")  # Show cursor
+            self.restore_terminal()
+        
+        return False
