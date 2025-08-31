@@ -1,94 +1,85 @@
 #!/usr/bin/env python3
 """
-Configuration Scanner
-Scans for WireGuard configurations in common locations
+Menu Handler for WireGuard Manager
 """
 
-import glob
-from pathlib import Path
+import sys
 from typing import List, Optional
 
-class ConfigScanner:
-    """Scan system for WireGuard configurations"""
+try:
+    from simple_term_menu import TerminalMenu
+except ImportError:
+    print("Error: simple_term_menu is not installed")
+    print("Please install it with: pip3 install simple-term-menu")
+    sys.exit(1)
+
+class MenuHandler:
+    """Handle terminal menus"""
     
-    # Default paths to scan
-    SCAN_PATHS = [
-        "/etc/wireguard",
-        "/opt/wireguard",
-        "/root/wireguard",
-        "/root",  # Check root directory
-        "/home/*/wireguard",
-        str(Path.home() / "wireguard"),
-        str(Path.home())  # Check home directory
-    ]
-    
-    def __init__(self):
-        self.detected_paths = []
-        self.primary_config_dir = None
-        self.scan()
-    
-    def scan(self):
-        """Scan for WireGuard configurations"""
-        self.detected_paths = []
+    def show_menu(self, options: List[str], title: str = None) -> Optional[int]:
+        """Show a menu and return the selected index"""
+        if not options:
+            return None
         
-        for path_pattern in self.SCAN_PATHS:
-            # Handle wildcards
-            if "*" in path_pattern:
-                for expanded_path in glob.glob(path_pattern):
-                    self._check_path(Path(expanded_path))
+        # Filter out separators for indexing
+        selectable_options = []
+        for opt in options:
+            if opt.startswith("─"):
+                selectable_options.append(None)
             else:
-                self._check_path(Path(path_pattern))
+                selectable_options.append(opt)
         
-        # Set primary config directory
-        if self.detected_paths:
-            self.primary_config_dir = Path(self.detected_paths[0])
-        else:
-            self.primary_config_dir = Path("/etc/wireguard")
+        menu_title = f"\n{title}\n" if title else "\n"
+        
+        try:
+            # Use default styles or minimal styling
+            menu = TerminalMenu(
+                options,
+                title=menu_title,
+                cursor_index=0,
+                clear_screen=False,
+                skip_empty_entries=True
+            )
+            
+            selected = menu.show()
+            
+            # Handle separator selection
+            if selected is not None and options[selected].startswith("─"):
+                return self.show_menu(options, title)  # Re-show menu
+            
+            return selected
+            
+        except Exception as e:
+            # Fallback to simple numbered menu
+            print(menu_title)
+            for i, option in enumerate(options, 1):
+                if not option.startswith("─"):
+                    print(f"{i}. {option}")
+                else:
+                    print()
+            
+            try:
+                choice = input("\nSelect option (or press Enter to cancel): ").strip()
+                if not choice:
+                    return None
+                
+                idx = int(choice) - 1
+                if 0 <= idx < len(options):
+                    return idx
+                else:
+                    print("Invalid selection")
+                    return None
+                    
+            except (ValueError, KeyboardInterrupt):
+                return None
     
-    def _check_path(self, path: Path):
-        """Check if path contains WireGuard configs"""
-        if not path.exists() or not path.is_dir():
-            return
-        
-        # Look for .conf files
-        conf_files = list(path.glob("*.conf"))
-        
-        # Also check for wg*.conf pattern in root directories
-        if path.name in ["root", "home"]:
-            conf_files.extend(list(path.glob("wg*.conf")))
-        
-        if conf_files:
-            self.detected_paths.append(str(path))
-    
-    def get_config_dir(self) -> Path:
-        """Get primary configuration directory"""
-        if not self.primary_config_dir:
-            self.primary_config_dir = Path("/etc/wireguard")
-        return self.primary_config_dir
-    
-    def get_interfaces(self) -> List[str]:
-        """Get list of configured interfaces"""
-        interfaces = []
-        config_dir = self.get_config_dir()
-        
-        if config_dir.exists():
-            for conf_file in config_dir.glob("*.conf"):
-                interfaces.append(conf_file.stem)
-        
-        return interfaces
-    
-    def get_config_file(self, interface: str) -> Optional[Path]:
-        """Get config file path for an interface"""
-        config_dir = self.get_config_dir()
-        config_file = config_dir / f"{interface}.conf"
-        
-        if config_file.exists():
-            return config_file
-        
-        # Check other detected paths
-        for path in self.detected_paths:
-            alt_file = Path(path) / f"{interface}.conf"
-            if alt_file.exists():
-                return alt_file
-        
-        return None
+    def confirm(self, message: str) -> bool:
+        """Show a yes/no confirmation prompt"""
+        while True:
+            response = input(f"\n{message} (y/n): ").strip().lower()
+            if response in ['y', 'yes']:
+                return True
+            elif response in ['n', 'no', '']:
+                return False
+            else:
+                print("Please enter 'y' or 'n'")
