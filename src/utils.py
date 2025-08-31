@@ -146,3 +146,23 @@ def get_version() -> str:
     if version_file.exists():
         return version_file.read_text().strip()
     return "unknown"
+
+def run_command(cmd: List[str], check: bool = True, cwd: Path = None, print_output: bool = False) -> subprocess.CompletedProcess:
+    """Run a system command"""
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=not print_output,
+            text=True,
+            check=check,
+            cwd=cwd
+        )
+        if print_output and result.returncode == 0:
+            print(result.stdout)
+        return result
+    except subprocess.CalledProcessError as e:
+        if check:
+            print(f"Error running command: {' '.join(cmd)}")
+            if e.stderr:
+                print(f"Error: {e.stderr}")
+        return e

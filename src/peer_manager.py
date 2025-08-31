@@ -380,3 +380,78 @@ class PeerManager:
                     peers[interface] = interface_peers
         
         return peers
+    
+    def show_peer_config(self):
+        """Show configuration for a specific peer."""
+        print("\n[Show Peer Config]")
+        print("-" * 50)
+        
+        peer_dir = self.scanner.get_config_dir() / "peers"
+        if not peer_dir.exists():
+            print("No peers configured")
+            pause()
+            return
+        
+        peer_files = list(peer_dir.glob("*.conf"))
+        if not peer_files:
+            print("No peer configurations found")
+            pause()
+            return
+        
+        peer_names = [f.stem for f in peer_files]
+        choice = self.menu.show_menu(peer_names, "Select peer:")
+        
+        if choice is None:
+            return
+        
+        peer_file = peer_files[choice]
+        print(f"\nConfiguration for {peer_names[choice]}:")
+        print("-" * 50)
+        print(peer_file.read_text())
+        pause()
+
+    def generate_qr_code(self):
+        """Generate QR code for peer configuration."""
+        print("\n[Generate QR Code]")
+        print("-" * 50)
+        
+        peer_dir = self.scanner.get_config_dir() / "peers"
+        if not peer_dir.exists():
+            print("No peers configured")
+            pause()
+            return
+        
+        peer_files = list(peer_dir.glob("*.conf"))
+        if not peer_files:
+            print("No peer configurations found")
+            pause()
+            return
+        
+        peer_names = [f.stem for f in peer_files]
+        choice = self.menu.show_menu(peer_names, "Select peer for QR code:")
+        
+        if choice is None:
+            return
+        
+        peer_file = peer_files[choice]
+        
+        # Check if qrencode is installed
+        if shutil.which("qrencode") is None:
+            print("qrencode is not installed!")
+            if self.menu.confirm("Install qrencode?"):
+                run_command(["apt-get", "install", "-y", "qrencode"], check=False)
+        
+        # Generate QR code
+        print(f"\nQR Code for {peer_names[choice]}:")
+        print("-" * 50)
+        
+        result = run_command(["qrencode", "-t", "ansiutf8"], 
+                            input=peer_file.read_text(), 
+                            check=False)
+        
+        if result.returncode == 0:
+            print(result.stdout)
+        else:
+            print("Failed to generate QR code")
+        
+        pause()
