@@ -3,7 +3,7 @@
 import json
 import shutil
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 from datetime import datetime
 from jinja2 import Template, Environment, FileSystemLoader
 from rich.console import Console
@@ -27,11 +27,17 @@ class FirewallManager:
         self.service_manager = ServiceManager()
         self.firewall_dir = Path("/etc/wireguard/firewall")
         self.rules_file = self.firewall_dir / "rules.conf"
-        self.banned_ips_file = self.firewall_dir / "banned_ips.txt"
+        
+        # Support both old and new banned IPs locations
+        self.old_banned_ips_file = Path("/etc/wireguard/banned_ips.txt")
+        self.banned_ips_file = self.firewall_dir / "banned_ips.json"
+        self.banned_ips_txt = self.firewall_dir / "banned_ips.txt"
+        
         self.service_name = "wireguard-firewall"
         self.service_file = Path(f"/etc/systemd/system/{self.service_name}.service")
         self._setup_jinja_env()
         self._ensure_firewall_setup()
+        self._migrate_banned_ips()
     
     def _setup_jinja_env(self):
         """Setup Jinja2 environment for templates."""
@@ -80,12 +86,106 @@ class FirewallManager:
             console.print("[yellow]Found old firewall-rules service, cleaning up...[/yellow]")
             run_command(["systemctl", "stop", "wg-quick@firewall-rules.service"], check=False)
             run_command(["systemctl", "disable", "wg-quick@firewall-rules.service"], check=False)
+            run_command(["systemctl", "reset-failed", "wg-quick@firewall-rules.service"], check=False)
             
             # Move old config if exists
             old_config = Path("/etc/wireguard/firewall-rules.conf")
             if old_config.exists() and not self.rules_file.exists():
                 console.print(f"[cyan]Moving existing rules to {self.rules_file}[/cyan]")
                 shutil.move(str(old_config), str(self.rules_file))
+    
+    def _migrate_banned_ips(self) -> None:
+        """Migrate old banned IPs file to new JSON format."""
+        if self.old_banned_ips_file.exists() and not self.banned_ips_file.exists():
+            console.print("[yellow]Migrating banned IPs to new format...[/yellow]")
+            banned_ips = []
+            
+            try:
+                with open(self.old_banned_ips_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            # Handle pipe delimiter
+                            if '|' in line:
+                                parts = line.split('|', 1)
+                                ip = parts[0].strip()
+                                comment = parts[1].strip() if len(parts) > 1 else ""
+                            # Handle space/hash delimiter
+                            elif '#' in line:
+                                parts = line.split('#', 1)
+                                ip = parts[0].strip()
+                                comment = parts[1].strip() if len(parts) > 1 else ""
+                            else:
+                                ip = line.strip()
+                                comment = ""
+                            
+                            if ip:
+                                banned_ips.append({
+                                    'ip': ip,
+                                    'comment': comment,
+                                    'date': datetime.now().isoformat()
+                                })
+                
+                # Save as JSON
+                ensure_directory(self.firewall_dir)
+                with open(self.banned_ips_file, 'w') as f:
+                    json.dump(banned_ips, f, indent=2)
+                
+                # Also create text version for scripts
+                with open(self.banned_ips_txt, 'w') as f:
+                    for entry in banned_ips:
+                        f.write(f"{entry['ip']} # {entry['comment']}\n")
+                
+                console.print(f"[green]✓ Migrated {len(banned_ips)} banned IPs[/green]")
+                
+                # Apply bans to firewall
+                self._apply_banned_ips_to_firewall(banned_ips)
+                
+            except Exception as e:
+                console.print(f"[red]Migration failed: {e}[/red]")
+    
+    def _load_banned_ips(self) -> List[Dict]:
+        """Load banned IPs from JSON file."""
+        if self.banned_ips_file.exists():
+            try:
+                with open(self.banned_ips_file, 'r') as f:
+                    return json.load(f)
+            except:
+                return []
+        
+        # Try old file if new doesn't exist
+        if self.old_banned_ips_file.exists():
+            self._migrate_banned_ips()
+            if self.banned_ips_file.exists():
+                with open(self.banned_ips_file, 'r') as f:
+                    return json.load(f)
+        
+        return []
+    
+    def _save_banned_ips(self, banned_ips: List[Dict]) -> None:
+        """Save banned IPs to JSON and text files."""
+        ensure_directory(self.firewall_dir)
+        
+        # Save JSON
+        with open(self.banned_ips_file, 'w') as f:
+            json.dump(banned_ips, f, indent=2)
+        
+        # Save text version for scripts
+        with open(self.banned_ips_txt, 'w') as f:
+            for entry in banned_ips:
+                f.write(f"{entry['ip']} # {entry['comment']}\n")
+    
+    def _apply_banned_ips_to_firewall(self, banned_ips: List[Dict]) -> None:
+        """Apply banned IPs to iptables BANNED_IPS chain."""
+        self._ensure_banned_ips_chain()
+        
+        # Flush existing rules
+        run_command(["iptables", "-F", "BANNED_IPS"], check=False)
+        
+        # Add each banned IP
+        for entry in banned_ips:
+            cmd = ["iptables", "-A", "BANNED_IPS", "-s", entry['ip'], "-j", "DROP"]
+            run_command(cmd, check=False)
     
     def setup_firewall_service(self) -> None:
         """Setup the firewall service and scripts from templates."""
@@ -149,7 +249,7 @@ class FirewallManager:
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 'firewall_dir': str(self.firewall_dir),
                 'rules_file': str(self.rules_file),
-                'banned_ips_file': str(self.banned_ips_file),
+                'banned_ips_file': str(self.banned_ips_txt),
                 'external_interface': config.get('external_interface', 'eth0'),
                 'interfaces': interfaces
             }
@@ -246,6 +346,20 @@ iptables -t filter -L BANNED_IPS &>/dev/null || {{
     iptables -I INPUT 1 -j BANNED_IPS
     iptables -I FORWARD 1 -j BANNED_IPS
 }}
+
+# Load banned IPs if file exists
+if [ -f "{data['banned_ips_file']}" ]; then
+    echo "Loading banned IPs..."
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${{line// }}" ]] && continue
+        
+        ip=$(echo "$line" | cut -d' ' -f1)
+        if [ ! -z "$ip" ]; then
+            iptables -A BANNED_IPS -s "$ip" -j DROP 2>/dev/null
+        fi
+    done < "{data['banned_ips_file']}"
+fi
 
 # Apply rules from config file
 RULES_FILE="{data['rules_file']}"
@@ -409,6 +523,15 @@ exit 0"""
         
         if banned_count > 0:
             console.print(f"  [yellow]⚠ {banned_count} IP(s) banned[/yellow]")
+            
+            # Show first few banned IPs
+            banned_ips = self._load_banned_ips()
+            if banned_ips:
+                console.print("  Recent bans:")
+                for entry in banned_ips[:3]:
+                    console.print(f"    • {entry['ip']} - {entry.get('comment', 'No comment')}")
+                if len(banned_ips) > 3:
+                    console.print(f"    ... and {len(banned_ips) - 3} more")
         else:
             console.print("  [green]✓ No banned IPs[/green]")
     
@@ -424,6 +547,31 @@ exit 0"""
         else:
             console.print("  [yellow]No rules file configured[/yellow]")
     
+    def start_firewall_service(self) -> None:
+        """Start the firewall service."""
+        console.print("[cyan]Starting firewall service...[/cyan]")
+        
+        # Enable and start service
+        run_command(["systemctl", "enable", self.service_name], check=False)
+        result = run_command(["systemctl", "start", self.service_name], check=False)
+        
+        if result.returncode == 0:
+            console.print("[green]✓ Firewall service started[/green]")
+        else:
+            console.print("[red]Failed to start firewall service[/red]")
+            if result.stderr:
+                console.print(f"[red]{result.stderr}[/red]")
+    
+    def restart_firewall_service(self) -> None:
+        """Restart the firewall service."""
+        console.print("[cyan]Restarting firewall service...[/cyan]")
+        result = run_command(["systemctl", "restart", self.service_name], check=False)
+        
+        if result.returncode == 0:
+            console.print("[green]✓ Firewall service restarted[/green]")
+        else:
+            console.print("[red]Failed to restart firewall service[/red]")
+    
     def manage_nat_rules(self) -> None:
         """Manage NAT/Masquerade rules."""
         console.print(Panel.fit(
@@ -433,12 +581,12 @@ exit 0"""
         
         options = [
             "View NAT rules",
-            "Add masquerade rule", 
+            "Add masquerade rule",
             "Add SNAT rule",
             "Remove NAT rule",
             "Edit rules file",
-            "Restart firewall service",  # Added
-            "Rebuild firewall service",   # Added
+            "Restart firewall service",
+            "Rebuild firewall service",
             "Back"
         ]
         
@@ -546,13 +694,14 @@ exit 0"""
             "Clear all bans",
             "Import ban list",
             "Export ban list",
+            "Scan for banned IP files",
             "Back"
         ]
         
         for i, option in enumerate(options, 1):
             console.print(f"  {i}. {option}")
         
-        choice = IntPrompt.ask("Select option", choices=[str(i) for i in range(1, 9)])
+        choice = IntPrompt.ask("Select option", choices=[str(i) for i in range(1, 10)])
         
         if choice == 1:
             self._view_banned_ips()
@@ -568,6 +717,8 @@ exit 0"""
             self._import_ban_list()
         elif choice == 7:
             self._export_ban_list()
+        elif choice == 8:
+            self._scan_for_banned_ip_files()
     
     def apply_nat_rules(self) -> None:
         """Apply standard NAT rules for WireGuard."""
@@ -589,6 +740,283 @@ exit 0"""
             else:
                 console.print("[red]Failed to restart firewall service[/red]")
                 console.print("[yellow]Try: systemctl status wireguard-firewall[/yellow]")
+    
+    def _scan_for_banned_ip_files(self) -> None:
+        """Scan for banned IP files and import them."""
+        console.print("\n[cyan]Scanning for banned IP files...[/cyan]")
+        
+        search_paths = [
+            Path("/etc/wireguard/banned_ips.txt"),
+            Path("/etc/wireguard/banned_ips.conf"),
+            Path("/etc/wireguard/firewall/banned_ips.txt"),
+            Path("/etc/wireguard/firewall/banned_ips.json"),
+            Path("/root/banned_ips.txt"),
+            Path("/home/banned_ips.txt"),
+        ]
+        
+        # Also search in home directories
+        for home_dir in Path("/home").iterdir():
+            if home_dir.is_dir():
+                search_paths.append(home_dir / "banned_ips.txt")
+        
+        found_files = []
+        for path in search_paths:
+            if path.exists():
+                size = path.stat().st_size
+                lines = len(path.read_text().split('\n'))
+                found_files.append((path, size, lines))
+                console.print(f"  [green]✓[/green] Found: {path} ({size} bytes, {lines} lines)")
+        
+        if not found_files:
+            console.print("[yellow]No banned IP files found[/yellow]")
+            return
+        
+        console.print("\n[cyan]Select file to import:[/cyan]")
+        for i, (path, size, lines) in enumerate(found_files, 1):
+            console.print(f"  {i}. {path} ({lines} lines)")
+        
+        choice = IntPrompt.ask("Select file (0 to cancel)", 
+                               choices=[str(i) for i in range(0, len(found_files) + 1)])
+        
+        if choice == 0:
+            return
+        
+        selected_file = found_files[choice - 1][0]
+        self._import_specific_file(selected_file)
+    
+    def _import_specific_file(self, file_path: Path) -> None:
+        """Import a specific banned IPs file."""
+        console.print(f"\n[cyan]Importing from {file_path}...[/cyan]")
+        
+        banned_ips = self._load_banned_ips()
+        existing_ips = {entry['ip'] for entry in banned_ips}
+        
+        imported = 0
+        with open(file_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    # Handle different delimiters
+                    if '|' in line:
+                        parts = line.split('|', 1)
+                        ip = parts[0].strip()
+                        comment = parts[1].strip() if len(parts) > 1 else ""
+                    elif '#' in line:
+                        parts = line.split('#', 1)
+                        ip = parts[0].strip()
+                        comment = parts[1].strip() if len(parts) > 1 else ""
+                    else:
+                        ip = line.strip()
+                        comment = "Imported"
+                    
+                    if ip and ip not in existing_ips:
+                        banned_ips.append({
+                            'ip': ip,
+                            'comment': comment,
+                            'date': datetime.now().isoformat()
+                        })
+                        existing_ips.add(ip)
+                        imported += 1
+        
+        if imported > 0:
+            self._save_banned_ips(banned_ips)
+            self._apply_banned_ips_to_firewall(banned_ips)
+            console.print(f"[green]✓ Imported {imported} new banned IP(s)[/green]")
+        else:
+            console.print("[yellow]No new IPs to import (all already banned)[/yellow]")
+    
+    def _view_banned_ips(self) -> None:
+        """View banned IP addresses."""
+        console.print("\n[cyan]Banned IP Addresses:[/cyan]")
+        
+        banned_ips = self._load_banned_ips()
+        
+        if banned_ips:
+            table = Table(show_header=True, header_style="bold magenta")
+            table.add_column("#", width=3)
+            table.add_column("IP Address", style="yellow")
+            table.add_column("Comment")
+            table.add_column("Date Added")
+            
+            for i, entry in enumerate(banned_ips, 1):
+                date_str = entry.get('date', 'Unknown')
+                if 'T' in date_str:
+                    date_str = date_str.split('T')[0]
+                
+                table.add_row(
+                    str(i),
+                    entry['ip'],
+                    entry.get('comment', ''),
+                    date_str
+                )
+            
+            console.print(table)
+            console.print(f"\n[cyan]Total banned IPs:[/cyan] {len(banned_ips)}")
+            
+            # Check iptables status
+            result = run_command(["iptables", "-L", "BANNED_IPS", "-n"], check=False)
+            if result.returncode == 0:
+                active_count = result.stdout.count('DROP')
+                console.print(f"[cyan]Active in firewall:[/cyan] {active_count}")
+                
+                if active_count != len(banned_ips):
+                    console.print("[yellow]⚠ Mismatch between file and firewall[/yellow]")
+                    if prompt_yes_no("Sync firewall with banned IPs file?", default=True):
+                        self._apply_banned_ips_to_firewall(banned_ips)
+                        console.print("[green]✓ Firewall synced[/green]")
+        else:
+            console.print("[yellow]No banned IPs found[/yellow]")
+            
+            # Check for old file
+            if self.old_banned_ips_file.exists():
+                console.print(f"\n[yellow]Found old banned IPs file at {self.old_banned_ips_file}[/yellow]")
+                if prompt_yes_no("Import old banned IPs?", default=True):
+                    self._migrate_banned_ips()
+    
+    def _ban_ip(self) -> None:
+        """Ban an IP address."""
+        console.print("\n[cyan]Ban IP Address[/cyan]")
+        
+        ip = Prompt.ask("IP address to ban")
+        comment = Prompt.ask("Comment/reason", default="Manual ban")
+        
+        banned_ips = self._load_banned_ips()
+        
+        # Check if already banned
+        for entry in banned_ips:
+            if entry['ip'] == ip:
+                console.print(f"[yellow]IP {ip} is already banned[/yellow]")
+                return
+        
+        # Add to list
+        banned_ips.append({
+            'ip': ip,
+            'comment': comment,
+            'date': datetime.now().isoformat()
+        })
+        
+        self._save_banned_ips(banned_ips)
+        
+        # Apply to firewall
+        self._ensure_banned_ips_chain()
+        cmd = ["iptables", "-A", "BANNED_IPS", "-s", ip, "-j", "DROP"]
+        result = run_command(cmd, check=False)
+        
+        if result.returncode == 0:
+            console.print(f"[green]✓ IP {ip} banned[/green]")
+        else:
+            console.print(f"[red]Failed to ban IP in firewall: {result.stderr}[/red]")
+    
+    def _unban_ip(self) -> None:
+        """Unban an IP address."""
+        banned_ips = self._load_banned_ips()
+        
+        if not banned_ips:
+            console.print("[yellow]No banned IPs to unban[/yellow]")
+            return
+        
+        self._view_banned_ips()
+        
+        console.print("\n[cyan]Unban IP Address[/cyan]")
+        choice = Prompt.ask("Enter IP address or # to unban")
+        
+        ip_to_unban = None
+        
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(banned_ips):
+                ip_to_unban = banned_ips[idx]['ip']
+                banned_ips.pop(idx)
+        else:
+            # Remove by IP
+            for i, entry in enumerate(banned_ips):
+                if entry['ip'] == choice:
+                    ip_to_unban = entry['ip']
+                    banned_ips.pop(i)
+                    break
+        
+        if ip_to_unban:
+            self._save_banned_ips(banned_ips)
+            
+            # Remove from firewall
+            cmd = ["iptables", "-D", "BANNED_IPS", "-s", ip_to_unban, "-j", "DROP"]
+            run_command(cmd, check=False)
+            
+            console.print(f"[green]✓ IP {ip_to_unban} unbanned[/green]")
+        else:
+            console.print("[red]IP not found in ban list[/red]")
+    
+    def _ban_ip_range(self) -> None:
+        """Ban an IP range."""
+        console.print("\n[cyan]Ban IP Range[/cyan]")
+        
+        ip_range = Prompt.ask("IP range to ban (e.g., 192.168.1.0/24)")
+        comment = Prompt.ask("Comment/reason", default="Range ban")
+        
+        banned_ips = self._load_banned_ips()
+        
+        # Add to list
+        banned_ips.append({
+            'ip': ip_range,
+            'comment': comment,
+            'date': datetime.now().isoformat()
+        })
+        
+        self._save_banned_ips(banned_ips)
+        
+        # Apply to firewall
+        self._ensure_banned_ips_chain()
+        cmd = ["iptables", "-A", "BANNED_IPS", "-s", ip_range, "-j", "DROP"]
+        result = run_command(cmd, check=False)
+        
+        if result.returncode == 0:
+            console.print(f"[green]✓ IP range {ip_range} banned[/green]")
+        else:
+            console.print(f"[red]Failed: {result.stderr}[/red]")
+    
+    def _clear_all_bans(self) -> None:
+        """Clear all banned IPs."""
+        if not prompt_yes_no("Remove ALL banned IPs?", default=False):
+            return
+        
+        # Clear the files
+        self._save_banned_ips([])
+        
+        # Flush BANNED_IPS chain
+        run_command(["iptables", "-F", "BANNED_IPS"], check=False)
+        
+        console.print("[green]✓ All IP bans cleared[/green]")
+    
+    def _import_ban_list(self) -> None:
+        """Import IP ban list from file."""
+        console.print("\n[cyan]Import Ban List[/cyan]")
+        
+        file_path = Prompt.ask("Path to ban list file", default="/tmp/ban_list.txt")
+        file_path = Path(file_path)
+        
+        if not file_path.exists():
+            console.print(f"[red]File not found: {file_path}[/red]")
+            return
+        
+        self._import_specific_file(file_path)
+    
+    def _export_ban_list(self) -> None:
+        """Export IP ban list to file."""
+        console.print("\n[cyan]Export Ban List[/cyan]")
+        
+        file_path = Prompt.ask("Export to file", default="/tmp/ban_list_export.txt")
+        
+        banned_ips = self._load_banned_ips()
+        
+        with open(file_path, 'w') as f:
+            f.write(f"# WireGuard Banned IPs - Exported {datetime.now()}\n")
+            f.write("# Format: IP_ADDRESS | comment\n\n")
+            
+            for entry in banned_ips:
+                f.write(f"{entry['ip']}|{entry.get('comment', '')}\n")
+        
+        console.print(f"[green]✓ Ban list exported to {file_path}[/green]")
+        console.print(f"  Exported {len(banned_ips)} banned IP(s)")
     
     def _edit_rules_file(self) -> None:
         """Edit the firewall rules file."""
@@ -946,182 +1374,6 @@ exit 0"""
             else:
                 console.print(f"[red]Failed: {result.stderr}[/red]")
     
-    def _view_banned_ips(self) -> None:
-        """View banned IP addresses."""
-        console.print("\n[cyan]Banned IP Addresses:[/cyan]")
-        
-        # Check BANNED_IPS chain
-        result = run_command(
-            ["iptables", "-L", "BANNED_IPS", "-n", "-v", "--line-numbers"],
-            check=False
-        )
-        
-        if result.returncode == 0:
-            lines = result.stdout.split('\n')
-            ban_rules = [line for line in lines if 'DROP' in line]
-            
-            if ban_rules:
-                table = Table(show_header=True, header_style="bold magenta")
-                table.add_column("#", width=3)
-                table.add_column("IP Address")
-                table.add_column("Packets", justify="right")
-                table.add_column("Bytes", justify="right")
-                
-                for rule in ban_rules:
-                    parts = rule.split()
-                    if len(parts) >= 7:
-                        num = parts[0]
-                        packets = parts[1]
-                        bytes_val = parts[2]
-                        
-                        # Find IP
-                        ip = "unknown"
-                        for part in parts[7:]:
-                            if '.' in part:
-                                ip = part
-                                break
-                        
-                        table.add_row(num, ip, packets, bytes_val)
-                
-                console.print(table)
-            else:
-                console.print("[yellow]No banned IPs found[/yellow]")
-        else:
-            console.print("[yellow]BANNED_IPS chain not found[/yellow]")
-            if prompt_yes_no("Create BANNED_IPS chain?", default=True):
-                self._ensure_banned_ips_chain()
-    
-    def _ban_ip(self) -> None:
-        """Ban an IP address."""
-        console.print("\n[cyan]Ban IP Address[/cyan]")
-        
-        ip = Prompt.ask("IP address to ban")
-        comment = Prompt.ask("Comment/reason (optional)", default="Manual ban")
-        
-        # Ensure BANNED_IPS chain exists
-        self._ensure_banned_ips_chain()
-        
-        # Add to BANNED_IPS chain
-        cmd = ["iptables", "-A", "BANNED_IPS", "-s", ip, "-j", "DROP"]
-        
-        result = run_command(cmd, check=False)
-        if result.returncode == 0:
-            console.print(f"[green]✓ IP {ip} banned[/green]")
-            
-            # Save to file
-            ensure_directory(self.firewall_dir)
-            with open(self.banned_ips_file, 'a') as f:
-                f.write(f"{ip} # {comment} # {datetime.now():%Y-%m-%d %H:%M}\n")
-        else:
-            console.print(f"[red]Failed to ban IP: {result.stderr}[/red]")
-    
-    def _unban_ip(self) -> None:
-        """Unban an IP address."""
-        self._view_banned_ips()
-        
-        console.print("\n[cyan]Unban IP Address[/cyan]")
-        choice = Prompt.ask("Enter IP to unban or rule # to remove")
-        
-        if choice.isdigit():
-            # Remove by rule number
-            cmd = ["iptables", "-D", "BANNED_IPS", choice]
-        else:
-            # Remove by IP
-            cmd = ["iptables", "-D", "BANNED_IPS", "-s", choice, "-j", "DROP"]
-        
-        result = run_command(cmd, check=False)
-        if result.returncode == 0:
-            console.print(f"[green]✓ IP unbanned[/green]")
-            
-            # Remove from file
-            if self.banned_ips_file.exists():
-                lines = self.banned_ips_file.read_text().split('\n')
-                new_lines = [line for line in lines if not line.startswith(choice)]
-                self.banned_ips_file.write_text('\n'.join(new_lines))
-        else:
-            console.print(f"[red]Failed to unban: {result.stderr}[/red]")
-    
-    def _ban_ip_range(self) -> None:
-        """Ban an IP range."""
-        console.print("\n[cyan]Ban IP Range[/cyan]")
-        
-        ip_range = Prompt.ask("IP range to ban (e.g., 192.168.1.0/24)")
-        comment = Prompt.ask("Comment/reason (optional)", default="Range ban")
-        
-        self._ensure_banned_ips_chain()
-        
-        cmd = ["iptables", "-A", "BANNED_IPS", "-s", ip_range, "-j", "DROP"]
-        
-        result = run_command(cmd, check=False)
-        if result.returncode == 0:
-            console.print(f"[green]✓ IP range {ip_range} banned[/green]")
-            
-            with open(self.banned_ips_file, 'a') as f:
-                f.write(f"{ip_range} # {comment} # {datetime.now():%Y-%m-%d %H:%M}\n")
-        else:
-            console.print(f"[red]Failed: {result.stderr}[/red]")
-    
-    def _clear_all_bans(self) -> None:
-        """Clear all banned IPs."""
-        if not prompt_yes_no("Remove ALL banned IPs?", default=False):
-            return
-        
-        # Flush BANNED_IPS chain
-        run_command(["iptables", "-F", "BANNED_IPS"], check=False)
-        
-        # Clear file
-        if self.banned_ips_file.exists():
-            self.banned_ips_file.write_text("")
-        
-        console.print("[green]✓ All IP bans cleared[/green]")
-    
-    def _import_ban_list(self) -> None:
-        """Import IP ban list from file."""
-        console.print("\n[cyan]Import Ban List[/cyan]")
-        
-        file_path = Prompt.ask("Path to ban list file", default="/tmp/ban_list.txt")
-        file_path = Path(file_path)
-        
-        if not file_path.exists():
-            console.print(f"[red]File not found: {file_path}[/red]")
-            return
-        
-        self._ensure_banned_ips_chain()
-        
-        imported = 0
-        with open(file_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#'):
-                    parts = line.split('#', 1)
-                    ip = parts[0].strip()
-                    comment = parts[1].strip() if len(parts) > 1 else "Imported"
-                    
-                    cmd = ["iptables", "-A", "BANNED_IPS", "-s", ip, "-j", "DROP"]
-                    
-                    result = run_command(cmd, check=False)
-                    if result.returncode == 0:
-                        imported += 1
-                        with open(self.banned_ips_file, 'a') as bf:
-                            bf.write(f"{ip} # {comment} # {datetime.now():%Y-%m-%d %H:%M}\n")
-        
-        console.print(f"[green]✓ Imported {imported} IP ban(s)[/green]")
-    
-    def _export_ban_list(self) -> None:
-        """Export IP ban list to file."""
-        console.print("\n[cyan]Export Ban List[/cyan]")
-        
-        file_path = Prompt.ask("Export to file", default="/tmp/ban_list_export.txt")
-        
-        with open(file_path, 'w') as f:
-            f.write(f"# WireGuard Banned IPs - Exported {datetime.now()}\n")
-            f.write("# Format: IP_ADDRESS # comment\n\n")
-            
-            if self.banned_ips_file.exists():
-                f.write(self.banned_ips_file.read_text())
-        
-        console.print(f"[green]✓ Ban list exported to {file_path}[/green]")
-    
     def _ensure_banned_ips_chain(self) -> None:
         """Ensure BANNED_IPS chain exists."""
         # Check if chain exists
@@ -1139,7 +1391,5 @@ exit 0"""
     
     def _get_banned_ip_count(self) -> int:
         """Get count of banned IPs."""
-        result = run_command(["iptables", "-L", "BANNED_IPS", "-n"], check=False)
-        if result.returncode == 0:
-            return result.stdout.count('DROP')
-        return 0
+        banned_ips = self._load_banned_ips()
+        return len(banned_ips)

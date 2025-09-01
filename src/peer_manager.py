@@ -18,6 +18,7 @@ from .utils import (
     get_next_available_ip, ensure_directory, run_command, prompt_yes_no
 )
 from .config_manager import ConfigManager
+from .service_manager import ServiceManager
 
 console = Console()
 
@@ -27,6 +28,7 @@ class PeerManager:
     def __init__(self):
         """Initialize peer manager."""
         self.config_manager = ConfigManager()
+        self.service_manager = ServiceManager()
         ensure_directory(PEERS_DIR, mode=0o700)
         self.peer_dirs_config = WIREGUARD_DIR / "peer_directories.json"
         self.peer_directories = self._load_peer_directories()
@@ -438,11 +440,11 @@ class PeerManager:
         table.add_column("Location")
         table.add_column("Status")
         
-        # Get active peers
+        # Get active peers (public keys)
         active_peers = self._get_active_peers()
         
         for i, (name, info) in enumerate(all_peers.items(), 1):
-            # Check if peer is active
+            # Check if peer is active by matching public key
             pub_key = info.get('public_key', '')
             status = "[green]Active[/green]" if pub_key in active_peers else "[red]Inactive[/red]"
             
@@ -462,6 +464,10 @@ class PeerManager:
         
         console.print(table)
         console.print(f"\n[cyan]Total peers found:[/cyan] {len(all_peers)}")
+        
+        # Show active connection details if any
+        if active_peers:
+            console.print(f"[cyan]Active connections:[/cyan] {len(active_peers)}")
     
     def show_qr_code(self) -> None:
         """Show QR code for a peer configuration."""
@@ -696,31 +702,60 @@ class PeerManager:
             
             content = config_file.read_text()
             
-            peer_pattern = r'#\s*Peer:\s*(.+?)\n.*?\[Peer\].*?AllowedIPs\s*=\s*([^\n]+)'
-            matches = re.finditer(peer_pattern, content, re.DOTALL)
+            # Find all [Peer] sections with their public keys
+            peer_sections = re.finditer(
+                r'(#\s*Peer:\s*(.+?)\n)?.*?\[Peer\]\s*\n(.*?)(?=\[Peer\]|\Z)',
+                content,
+                re.DOTALL
+            )
             
-            for match in matches:
-                peer_name = match.group(1).strip()
-                allowed_ips = match.group(2).strip()
+            for match in peer_sections:
+                peer_name = match.group(2) if match.group(2) else "unknown"
+                peer_config = match.group(3)
                 
-                ip = allowed_ips.split('/')[0] if '/' in allowed_ips else allowed_ips
+                # Extract public key
+                pub_key_match = re.search(r'PublicKey\s*=\s*([^\n]+)', peer_config)
+                pub_key = pub_key_match.group(1).strip() if pub_key_match else ""
                 
-                peers[peer_name] = {
-                    'interface': interface_file,
-                    'ip': ip,
-                    'location': 'server_config',
-                    'source': 'config'
-                }
+                # Extract allowed IPs
+                allowed_ips_match = re.search(r'AllowedIPs\s*=\s*([^\n]+)', peer_config)
+                allowed_ips = allowed_ips_match.group(1).strip() if allowed_ips_match else ""
+                
+                ip = allowed_ips.split('/')[0] if '/' in allowed_ips else allowed_ips.split(',')[0].strip()
+                
+                if pub_key:  # Only add if we have a public key
+                    peers[peer_name] = {
+                        'interface': interface_file,
+                        'ip': ip,
+                        'location': 'server_config',
+                        'source': 'config',
+                        'public_key': pub_key
+                    }
         
         return peers
     
-    def _get_active_peers(self) -> List[str]:
-        """Get list of active peer public keys."""
-        active = []
+    def _get_active_peers(self) -> Set[str]:
+        """Get set of active peer public keys."""
+        active = set()
         
+        # Get all interfaces
+        interfaces = self.service_manager.get_active_interfaces()
+        
+        for interface in interfaces:
+            # Get peers for this interface
+            result = run_command(["wg", "show", interface, "peers"], check=False)
+            if result.returncode == 0 and result.stdout:
+                # Each line is a public key
+                for line in result.stdout.strip().split('\n'):
+                    if line.strip():
+                        active.add(line.strip())
+        
+        # Also try getting all at once
         result = run_command(["wg", "show", "all", "peers"], check=False)
         if result.returncode == 0 and result.stdout:
-            active = result.stdout.strip().split('\n')
+            for line in result.stdout.strip().split('\n'):
+                if line.strip() and line.strip() != 'None':
+                    active.add(line.strip())
         
         return active
     
