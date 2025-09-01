@@ -163,12 +163,17 @@ class WireGuardManagerCLI:
         ))
         self.menu.add_category(config_category)
         
-        # Firewall
-        firewall_category = MenuCategory("Firewall & NAT", prefix="[F]")
+        # Firewall & Security
+        firewall_category = MenuCategory("Firewall & Security", prefix="[F]")
         firewall_category.add_item(MenuItem(
             "Firewall Status",
             self.wrap_action(self.firewall_manager.show_status),
-            description="View firewall rules"
+            description="View all firewall rules"
+        ))
+        firewall_category.add_item(MenuItem(
+            "NAT Rules Management",
+            self.wrap_action(self.firewall_manager.manage_nat_rules),
+            description="Manage NAT/Masquerade rules"
         ))
         firewall_category.add_item(MenuItem(
             "Port Forwarding",
@@ -176,9 +181,20 @@ class WireGuardManagerCLI:
             description="Configure port forwards"
         ))
         firewall_category.add_item(MenuItem(
-            "Apply NAT Rules",
+            "Forward Rules",
+            self.wrap_action(self.firewall_manager.manage_forward_rules),
+            description="Manage FORWARD chain"
+        ))
+        firewall_category.add_item(MenuItem(
+            "Banned IPs",
+            self.wrap_action(self.firewall_manager.manage_banned_ips),
+            description="Manage IP bans",
+            style="yellow"
+        ))
+        firewall_category.add_item(MenuItem(
+            "Apply Standard NAT",
             self.wrap_action(self.firewall_manager.apply_nat_rules),
-            description="Setup masquerading"
+            description="Quick NAT setup"
         ))
         self.menu.add_category(firewall_category)
         
@@ -212,6 +228,11 @@ class WireGuardManagerCLI:
             "Update WireGuard",
             self.wrap_action(self.installer.update_wireguard),
             description="Update WireGuard packages"
+        ))
+        system_category.add_item(MenuItem(
+            "Install WireGuard",
+            self.wrap_action(self.installer.install_wireguard),
+            description="Install WireGuard packages"
         ))
         system_category.add_item(MenuItem(
             "Install Manager System-wide",

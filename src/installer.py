@@ -5,6 +5,7 @@ import sys
 import shutil
 import subprocess
 import tempfile
+import requests
 from pathlib import Path
 from datetime import datetime
 from rich.console import Console
@@ -23,7 +24,8 @@ class WireGuardInstaller:
     def __init__(self):
         """Initialize installer."""
         self.install_dir = self._find_install_dir()
-        self.repo_url = "https://github.com/regix1/wireguard-manager"  # Update when available
+        self.repo_url = "https://github.com/regix1/wireguard-manager"
+        self.version_url = "https://raw.githubusercontent.com/regix1/wireguard-manager/refs/heads/main/VERSION"
     
     def _find_install_dir(self) -> Path:
         """Find where the manager is installed."""
@@ -202,95 +204,172 @@ class WireGuardInstaller:
             console.print("[green]✓[/green] WireGuard updated")
     
     def check_manager_updates(self) -> None:
-        """Check for manager updates."""
+        """Check for manager updates from GitHub."""
         console.print(Panel.fit(
             "[bold cyan]Check for Updates[/bold cyan]",
             border_style="cyan"
         ))
         
         console.print(f"Current version: {APP_VERSION}")
+        console.print("Checking GitHub for updates...")
         
-        if self.repo_url:
-            console.print("Checking for updates...")
-            try:
-                # Check GitHub releases
-                import requests
-                api_url = self.repo_url.replace("github.com", "api.github.com/repos") + "/releases/latest"
-                response = requests.get(api_url, timeout=5)
+        try:
+            # Fetch version from GitHub
+            response = requests.get(self.version_url, timeout=10)
+            
+            if response.status_code == 200:
+                remote_version = response.text.strip()
+                console.print(f"Latest version: {remote_version}")
                 
-                if response.status_code == 200:
-                    latest = response.json()
-                    latest_version = latest.get("tag_name", "").lstrip("v")
+                # Compare versions
+                if self._compare_versions(remote_version, APP_VERSION) > 0:
+                    console.print("\n[yellow]🔄 New version available![/yellow]")
+                    console.print(f"[cyan]Current:[/cyan] {APP_VERSION}")
+                    console.print(f"[cyan]Latest:[/cyan] {remote_version}")
+                    console.print(f"\n[cyan]View changes:[/cyan] {self.repo_url}/releases")
                     
-                    if latest_version and latest_version != APP_VERSION:
-                        console.print(f"[yellow]New version available: {latest_version}[/yellow]")
-                        console.print(f"Download: {latest.get('html_url', self.repo_url)}")
-                        
-                        if prompt_yes_no("Download and install update?", default=False):
-                            self.update_manager()
-                    else:
-                        console.print(f"[green]✓[/green] You are running the latest version {APP_VERSION}")
+                    if prompt_yes_no("\nDownload and install update?", default=True):
+                        self.update_manager()
                 else:
-                    console.print("[yellow]Could not check for updates[/yellow]")
-            except Exception as e:
-                console.print(f"[yellow]Update check failed: {e}[/yellow]")
-        else:
-            console.print("[yellow]Update checking is not configured[/yellow]")
-            console.print("This is a local installation")
-            console.print(f"\n[green]✓[/green] You are running version {APP_VERSION}")
+                    console.print(f"\n[green]✓ You are running the latest version ({APP_VERSION})[/green]")
+            else:
+                console.print(f"[yellow]Could not fetch version from GitHub (status: {response.status_code})[/yellow]")
+                
+        except requests.exceptions.Timeout:
+            console.print("[yellow]Connection timeout - GitHub may be unavailable[/yellow]")
+        except requests.exceptions.ConnectionError:
+            console.print("[yellow]Connection error - check your internet connection[/yellow]")
+        except Exception as e:
+            console.print(f"[yellow]Update check failed: {e}[/yellow]")
     
     def update_manager(self) -> None:
-        """Update the WireGuard Manager."""
+        """Update the WireGuard Manager from GitHub."""
         console.print(Panel.fit(
             "[bold cyan]Update WireGuard Manager[/bold cyan]",
             border_style="cyan"
         ))
         
-        if not self.repo_url:
-            console.print("[yellow]No update repository configured[/yellow]")
-            return
-        
-        console.print("Downloading latest version...")
+        console.print("Downloading latest version from GitHub...")
         
         try:
+            # Backup current installation
+            from .backup import BackupManager
+            backup_mgr = BackupManager()
+            backup_path = backup_mgr.create_backup("before_update")
+            console.print(f"[green]✓[/green] Backup created: {backup_path}")
+            
             with tempfile.TemporaryDirectory() as tmpdir:
-                # Clone repository
-                result = run_command([
-                    "git", "clone", "--depth", "1", 
-                    self.repo_url, tmpdir
-                ], check=False)
+                tmpdir_path = Path(tmpdir)
                 
-                if result.returncode != 0:
-                    console.print("[red]Failed to download update[/red]")
+                # Download repository as archive
+                archive_url = f"{self.repo_url}/archive/refs/heads/main.zip"
+                console.print(f"Downloading from: {archive_url}")
+                
+                response = requests.get(archive_url, timeout=30, stream=True)
+                if response.status_code != 200:
+                    console.print(f"[red]Failed to download (status: {response.status_code})[/red]")
                     return
                 
-                # Backup current installation
-                from .backup import BackupManager
-                backup_mgr = BackupManager()
-                backup_path = backup_mgr.create_backup("before_update")
+                # Save archive
+                archive_path = tmpdir_path / "update.zip"
+                with open(archive_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
                 
-                # Copy new files
-                tmpdir_path = Path(tmpdir)
-                if (tmpdir_path / "src").exists():
-                    shutil.rmtree(self.install_dir / "src", ignore_errors=True)
-                    shutil.copytree(tmpdir_path / "src", self.install_dir / "src")
+                console.print("[green]✓[/green] Download complete")
                 
-                if (tmpdir_path / "VERSION").exists():
-                    shutil.copy2(tmpdir_path / "VERSION", self.install_dir / "VERSION")
+                # Extract archive
+                console.print("Extracting files...")
+                import zipfile
+                with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                    zip_ref.extractall(tmpdir_path)
+                
+                # Find extracted directory
+                extracted_dir = tmpdir_path / "wireguard-manager-main"
+                if not extracted_dir.exists():
+                    # Try to find any extracted directory
+                    for item in tmpdir_path.iterdir():
+                        if item.is_dir() and item.name != "update.zip":
+                            extracted_dir = item
+                            break
+                
+                if not extracted_dir.exists():
+                    console.print("[red]Failed to extract update[/red]")
+                    return
+                
+                # Update files
+                console.print("Installing update...")
+                
+                # Update src directory
+                if (extracted_dir / "src").exists():
+                    src_dest = self.install_dir / "src"
+                    if src_dest.exists():
+                        shutil.rmtree(src_dest)
+                    shutil.copytree(extracted_dir / "src", src_dest)
+                    console.print("[green]✓[/green] Updated src directory")
+                
+                # Update VERSION file
+                if (extracted_dir / "VERSION").exists():
+                    shutil.copy2(extracted_dir / "VERSION", self.install_dir / "VERSION")
+                    new_version = (extracted_dir / "VERSION").read_text().strip()
+                    console.print(f"[green]✓[/green] Updated to version {new_version}")
+                
+                # Update other files
+                for file in ["requirements.txt", "setup.py", "auto_install.sh", "uninstall.sh"]:
+                    if (extracted_dir / file).exists():
+                        shutil.copy2(extracted_dir / file, self.install_dir / file)
+                        console.print(f"[green]✓[/green] Updated {file}")
+                
+                # Update data directory
+                if (extracted_dir / "data").exists():
+                    data_dest = self.install_dir / "data"
+                    if data_dest.exists():
+                        shutil.rmtree(data_dest)
+                    shutil.copytree(extracted_dir / "data", data_dest)
+                    console.print("[green]✓[/green] Updated data directory")
                 
                 # Update dependencies
-                if (tmpdir_path / "requirements.txt").exists():
-                    shutil.copy2(tmpdir_path / "requirements.txt", self.install_dir / "requirements.txt")
+                if (self.install_dir / "requirements.txt").exists():
+                    console.print("Updating dependencies...")
                     run_command([
                         sys.executable, "-m", "pip", "install", "-r",
-                        str(self.install_dir / "requirements.txt")
+                        str(self.install_dir / "requirements.txt"), "-q"
                     ])
+                    console.print("[green]✓[/green] Dependencies updated")
                 
-                console.print("[green]✓[/green] Update complete!")
-                console.print("Please restart the application")
+                console.print("\n[green]✓[/green] Update complete!")
+                console.print("[yellow]Please restart the application to use the new version[/yellow]")
                 
         except Exception as e:
             console.print(f"[red]Update failed: {e}[/red]")
+            console.print(f"[yellow]Backup available at: {backup_path}[/yellow]")
+    
+    def _compare_versions(self, version1: str, version2: str) -> int:
+        """Compare two version strings.
+        Returns: 1 if version1 > version2, -1 if version1 < version2, 0 if equal."""
+        try:
+            v1_parts = [int(x) for x in version1.split('.')]
+            v2_parts = [int(x) for x in version2.split('.')]
+            
+            # Pad with zeros if needed
+            max_len = max(len(v1_parts), len(v2_parts))
+            v1_parts.extend([0] * (max_len - len(v1_parts)))
+            v2_parts.extend([0] * (max_len - len(v2_parts)))
+            
+            for i in range(max_len):
+                if v1_parts[i] > v2_parts[i]:
+                    return 1
+                elif v1_parts[i] < v2_parts[i]:
+                    return -1
+            
+            return 0
+        except:
+            # Fallback to string comparison
+            if version1 > version2:
+                return 1
+            elif version1 < version2:
+                return -1
+            return 0
     
     def install_manager(self) -> None:
         """Install WireGuard Manager system-wide."""
@@ -419,6 +498,11 @@ export PYTHONPATH="{install_dir}/{module_name}:$PYTHONPATH"
                         os_name = line.split("=")[1].strip().strip('"')
                         console.print(f"[cyan]Operating System:[/cyan] {os_name}")
                         break
+        
+        # Check for updates
+        console.print("\n[cyan]Update Status:[/cyan]")
+        console.print(f"  Repository: {self.repo_url}")
+        console.print(f"  Version URL: {self.version_url}")
         
         console.print("\n[dim]Press Enter to continue...[/dim]")
         input()
