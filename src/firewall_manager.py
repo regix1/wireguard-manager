@@ -1,15 +1,20 @@
 """Firewall and NAT management for WireGuard."""
 
+import json
+import shutil
 from pathlib import Path
 from typing import List, Dict, Optional
 from datetime import datetime
+from jinja2 import Template, Environment, FileSystemLoader
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.prompt import Prompt, IntPrompt
+from rich.progress import Progress, SpinnerColumn, TextColumn
 
-from .utils import run_command, prompt_yes_no
+from .utils import run_command, prompt_yes_no, ensure_directory
 from .config_manager import ConfigManager
+from .service_manager import ServiceManager
 
 console = Console()
 
@@ -19,7 +24,288 @@ class FirewallManager:
     def __init__(self):
         """Initialize firewall manager."""
         self.config_manager = ConfigManager()
-        self.banned_ips_file = Path("/etc/wireguard/banned_ips.txt")
+        self.service_manager = ServiceManager()
+        self.firewall_dir = Path("/etc/wireguard/firewall")
+        self.rules_file = self.firewall_dir / "rules.conf"
+        self.banned_ips_file = self.firewall_dir / "banned_ips.txt"
+        self.service_name = "wireguard-firewall"
+        self.service_file = Path(f"/etc/systemd/system/{self.service_name}.service")
+        self._setup_jinja_env()
+        self._ensure_firewall_setup()
+    
+    def _setup_jinja_env(self):
+        """Setup Jinja2 environment for templates."""
+        template_dirs = [
+            Path(__file__).parent.parent / "data" / "templates",
+            Path.home() / "wireguard-manager" / "data" / "templates",
+            Path("/opt/wireguard-manager/data/templates"),
+        ]
+        
+        loaders = []
+        for path in template_dirs:
+            if path.exists():
+                loaders.append(FileSystemLoader(str(path)))
+        
+        if loaders:
+            from jinja2 import ChoiceLoader
+            self.env = Environment(
+                loader=ChoiceLoader(loaders),
+                trim_blocks=True,
+                lstrip_blocks=True,
+            )
+        else:
+            self.env = Environment()
+    
+    def _ensure_firewall_setup(self) -> None:
+        """Ensure firewall directory and service are properly set up."""
+        # Create firewall directory
+        ensure_directory(self.firewall_dir, mode=0o755)
+        
+        # Check for old broken service
+        self._cleanup_old_service()
+        
+        # Setup firewall if not exists
+        if not self.service_file.exists() or not (self.firewall_dir / "apply-rules.sh").exists():
+            console.print("[yellow]Firewall service not configured. Setting up...[/yellow]")
+            self.setup_firewall_service()
+    
+    def _cleanup_old_service(self) -> None:
+        """Clean up old broken wg-quick@firewall-rules service."""
+        result = run_command(
+            ["systemctl", "status", "wg-quick@firewall-rules.service"],
+            check=False
+        )
+        
+        if "loaded" in result.stdout.lower():
+            console.print("[yellow]Found old firewall-rules service, cleaning up...[/yellow]")
+            run_command(["systemctl", "stop", "wg-quick@firewall-rules.service"], check=False)
+            run_command(["systemctl", "disable", "wg-quick@firewall-rules.service"], check=False)
+            
+            # Move old config if exists
+            old_config = Path("/etc/wireguard/firewall-rules.conf")
+            if old_config.exists() and not self.rules_file.exists():
+                console.print(f"[cyan]Moving existing rules to {self.rules_file}[/cyan]")
+                shutil.move(str(old_config), str(self.rules_file))
+    
+    def setup_firewall_service(self) -> None:
+        """Setup the firewall service and scripts from templates."""
+        console.print(Panel.fit(
+            "[bold cyan]Setup Firewall Service[/bold cyan]",
+            border_style="cyan"
+        ))
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            transient=True,
+        ) as progress:
+            task = progress.add_task("Setting up firewall service...", total=None)
+            
+            # Get configuration
+            config = self.config_manager.load_config()
+            interfaces = []
+            
+            # Get all WireGuard interfaces
+            for interface_name in self.service_manager.get_interfaces():
+                interface_config = Path(f"/etc/wireguard/{interface_name}.conf")
+                if interface_config.exists():
+                    # Parse config to get subnet and port
+                    content = interface_config.read_text()
+                    subnet = config.get('server_subnet', '10.0.0.0/24')
+                    port = config.get('server_port', 51820)
+                    
+                    # Try to extract from config
+                    for line in content.split('\n'):
+                        if line.strip().startswith('Address'):
+                            addr = line.split('=')[1].strip()
+                            if '/' in addr:
+                                # Convert single IP to subnet
+                                ip_part = addr.split('/')[0]
+                                prefix = addr.split('/')[1]
+                                # Create subnet (e.g., 10.0.0.1/24 -> 10.0.0.0/24)
+                                octets = ip_part.split('.')
+                                if prefix == '24':
+                                    subnet = f"{octets[0]}.{octets[1]}.{octets[2]}.0/24"
+                                elif prefix == '32':
+                                    subnet = addr
+                        elif line.strip().startswith('ListenPort'):
+                            port = int(line.split('=')[1].strip())
+                    
+                    interfaces.append({
+                        'name': interface_name,
+                        'subnet': subnet,
+                        'port': port
+                    })
+            
+            if not interfaces:
+                # Default interface if none found
+                interfaces = [{
+                    'name': 'wg0',
+                    'subnet': config.get('server_subnet', '10.0.0.0/24'),
+                    'port': config.get('server_port', 51820)
+                }]
+            
+            template_data = {
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'firewall_dir': str(self.firewall_dir),
+                'rules_file': str(self.rules_file),
+                'banned_ips_file': str(self.banned_ips_file),
+                'external_interface': config.get('external_interface', 'eth0'),
+                'interfaces': interfaces
+            }
+            
+            # Create service file
+            progress.update(task, description="Creating service file...")
+            try:
+                service_template = self.env.get_template('firewall.service.j2')
+                service_content = service_template.render(**template_data)
+            except:
+                # Fallback if template not found
+                service_content = f"""[Unit]
+Description=WireGuard Firewall Rules
+After=network-pre.target
+Before=network.target wg-quick@wg0.service
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={self.firewall_dir}/apply-rules.sh
+ExecStop={self.firewall_dir}/remove-rules.sh
+ExecReload={self.firewall_dir}/apply-rules.sh
+
+[Install]
+WantedBy=multi-user.target"""
+            
+            self.service_file.write_text(service_content)
+            
+            # Create apply script
+            progress.update(task, description="Creating apply-rules script...")
+            try:
+                apply_template = self.env.get_template('apply-rules.sh.j2')
+                apply_content = apply_template.render(**template_data)
+            except:
+                # Fallback script
+                apply_content = self._get_default_apply_script(template_data)
+            
+            apply_script = self.firewall_dir / "apply-rules.sh"
+            apply_script.write_text(apply_content)
+            apply_script.chmod(0o755)
+            
+            # Create remove script
+            progress.update(task, description="Creating remove-rules script...")
+            try:
+                remove_template = self.env.get_template('remove-rules.sh.j2')
+                remove_content = remove_template.render(**template_data)
+            except:
+                # Fallback script
+                remove_content = self._get_default_remove_script(template_data)
+            
+            remove_script = self.firewall_dir / "remove-rules.sh"
+            remove_script.write_text(remove_content)
+            remove_script.chmod(0o755)
+            
+            # Create default rules file if not exists
+            if not self.rules_file.exists():
+                progress.update(task, description="Creating default rules file...")
+                try:
+                    rules_template = self.env.get_template('default-rules.conf.j2')
+                    rules_content = rules_template.render(**template_data)
+                except:
+                    rules_content = self._get_default_rules(template_data)
+                
+                self.rules_file.write_text(rules_content)
+            
+            # Reload systemd
+            progress.update(task, description="Reloading systemd...")
+            run_command(["systemctl", "daemon-reload"], check=False)
+            
+            # Enable and start service
+            progress.update(task, description="Starting firewall service...")
+            run_command(["systemctl", "enable", self.service_name], check=False)
+            result = run_command(["systemctl", "start", self.service_name], check=False)
+            
+            progress.update(task, completed=True)
+        
+        if result.returncode == 0:
+            console.print("[green]✓ Firewall service setup complete and started[/green]")
+        else:
+            console.print("[yellow]⚠ Firewall service created but failed to start[/yellow]")
+            console.print("[cyan]Check status with: systemctl status wireguard-firewall[/cyan]")
+    
+    def _get_default_apply_script(self, data: dict) -> str:
+        """Get default apply script if template not found."""
+        return f"""#!/bin/bash
+
+# Enable IP forwarding
+sysctl -w net.ipv4.ip_forward=1
+
+# Create BANNED_IPS chain if it doesn't exist
+iptables -t filter -L BANNED_IPS &>/dev/null || {{
+    iptables -N BANNED_IPS
+    iptables -I INPUT 1 -j BANNED_IPS
+    iptables -I FORWARD 1 -j BANNED_IPS
+}}
+
+# Apply rules from config file
+RULES_FILE="{data['rules_file']}"
+
+if [ -f "$RULES_FILE" ]; then
+    echo "Applying firewall rules from $RULES_FILE"
+    
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${{line// }}" ]] && continue
+        
+        eval "$line" 2>/dev/null || echo "Failed: $line"
+    done < "$RULES_FILE"
+    
+    echo "Firewall rules applied successfully"
+else
+    echo "No rules file found, applying defaults"
+    # Default NAT for WireGuard
+    iptables -t nat -A POSTROUTING -o {data['external_interface']} -s 10.0.0.0/24 -j MASQUERADE
+    iptables -A FORWARD -i wg0 -j ACCEPT
+    iptables -A FORWARD -o wg0 -j ACCEPT
+fi
+
+exit 0"""
+    
+    def _get_default_remove_script(self, data: dict) -> str:
+        """Get default remove script if template not found."""
+        return """#!/bin/bash
+
+# Remove BANNED_IPS chain
+iptables -D INPUT -j BANNED_IPS 2>/dev/null
+iptables -D FORWARD -j BANNED_IPS 2>/dev/null
+iptables -F BANNED_IPS 2>/dev/null
+iptables -X BANNED_IPS 2>/dev/null
+
+echo "Firewall rules removed"
+exit 0"""
+    
+    def _get_default_rules(self, data: dict) -> str:
+        """Get default rules if template not found."""
+        rules = [
+            f"# WireGuard Firewall Rules",
+            f"# Generated: {data['timestamp']}",
+            f"",
+            f"# NAT Rules",
+        ]
+        
+        for iface in data['interfaces']:
+            rules.append(f"iptables -t nat -A POSTROUTING -o {data['external_interface']} -s {iface['subnet']} -j MASQUERADE")
+        
+        rules.extend([
+            "",
+            "# Forward Rules",
+        ])
+        
+        for iface in data['interfaces']:
+            rules.append(f"iptables -A FORWARD -i {iface['name']} -j ACCEPT")
+            rules.append(f"iptables -A FORWARD -o {iface['name']} -j ACCEPT")
+        
+        return '\n'.join(rules)
     
     def show_status(self) -> None:
         """Show comprehensive firewall status."""
@@ -28,75 +314,115 @@ class FirewallManager:
             border_style="cyan"
         ))
         
-        # Show IP forwarding status
-        console.print("[cyan]IP Forwarding:[/cyan]")
+        # Service status
+        self._show_service_status()
+        
+        # IP forwarding
+        self._show_ip_forwarding()
+        
+        # NAT rules
+        self._show_nat_rules()
+        
+        # Port forwarding
+        self._show_port_forwarding()
+        
+        # Banned IPs
+        self._show_banned_ips_summary()
+        
+        # Rules file
+        self._show_rules_file_status()
+    
+    def _show_service_status(self) -> None:
+        """Show firewall service status."""
+        console.print("[cyan]Firewall Service:[/cyan]")
+        
+        result = run_command(["systemctl", "is-active", self.service_name], check=False)
+        
+        if result.returncode == 0:
+            console.print(f"  [green]● {self.service_name} is active[/green]")
+            
+            # Show last start time
+            result = run_command(
+                ["systemctl", "show", self.service_name, "--property=ActiveEnterTimestamp"],
+                check=False
+            )
+            if result.returncode == 0 and "=" in result.stdout:
+                timestamp = result.stdout.split("=")[1].strip()
+                if timestamp:
+                    console.print(f"  Started: {timestamp}")
+        else:
+            console.print(f"  [red]○ {self.service_name} is inactive[/red]")
+            console.print("  [yellow]Run 'Firewall & Security → Apply Standard NAT' to setup[/yellow]")
+    
+    def _show_ip_forwarding(self) -> None:
+        """Show IP forwarding status."""
+        console.print("\n[cyan]IP Forwarding:[/cyan]")
         with open("/proc/sys/net/ipv4/ip_forward", "r") as f:
             ip_forward = f.read().strip()
         
         if ip_forward == "1":
-            console.print("  [green]✓ Enabled[/green]")
+            console.print("  [green]✓ IPv4 forwarding enabled[/green]")
         else:
-            console.print("  [red]✗ Disabled[/red]")
-        
-        # Show NAT rules
-        console.print("\n[cyan]NAT Rules (POSTROUTING):[/cyan]")
+            console.print("  [red]✗ IPv4 forwarding disabled[/red]")
+    
+    def _show_nat_rules(self) -> None:
+        """Show NAT rules summary."""
+        console.print("\n[cyan]NAT Rules:[/cyan]")
         result = run_command(
-            ["iptables", "-t", "nat", "-L", "POSTROUTING", "-n", "-v", "--line-numbers"],
+            ["iptables", "-t", "nat", "-L", "POSTROUTING", "-n", "--line-numbers"],
             check=False
         )
         
         if result.returncode == 0:
             lines = result.stdout.split('\n')
-            nat_rules = [line for line in lines if 'MASQUERADE' in line or 'SNAT' in line or 'DNAT' in line]
+            masq_count = sum(1 for line in lines if 'MASQUERADE' in line)
+            snat_count = sum(1 for line in lines if 'SNAT' in line)
             
-            if nat_rules:
-                for rule in nat_rules:
-                    console.print(f"  {rule.strip()}")
+            if masq_count > 0 or snat_count > 0:
+                console.print(f"  [green]✓ {masq_count} MASQUERADE rule(s)[/green]")
+                if snat_count > 0:
+                    console.print(f"  [green]✓ {snat_count} SNAT rule(s)[/green]")
             else:
-                console.print("  [yellow]No NAT rules found[/yellow]")
-        
-        # Show port forwarding rules (PREROUTING)
-        console.print("\n[cyan]Port Forwarding Rules (PREROUTING):[/cyan]")
+                console.print("  [yellow]No NAT rules configured[/yellow]")
+    
+    def _show_port_forwarding(self) -> None:
+        """Show port forwarding summary."""
+        console.print("\n[cyan]Port Forwarding:[/cyan]")
         result = run_command(
-            ["iptables", "-t", "nat", "-L", "PREROUTING", "-n", "-v", "--line-numbers"],
+            ["iptables", "-t", "nat", "-L", "PREROUTING", "-n", "--line-numbers"],
             check=False
         )
         
         if result.returncode == 0:
             lines = result.stdout.split('\n')
-            forward_rules = [line for line in lines if 'DNAT' in line]
+            dnat_count = sum(1 for line in lines if 'DNAT' in line)
             
-            if forward_rules:
-                for rule in forward_rules:
-                    console.print(f"  {rule.strip()}")
+            if dnat_count > 0:
+                console.print(f"  [green]✓ {dnat_count} port forward rule(s)[/green]")
             else:
-                console.print("  [yellow]No port forwarding rules found[/yellow]")
-        
-        # Show forward rules
-        console.print("\n[cyan]Forward Rules:[/cyan]")
-        result = run_command(
-            ["iptables", "-L", "FORWARD", "-n", "-v", "--line-numbers"],
-            check=False
-        )
-        
-        if result.returncode == 0:
-            lines = result.stdout.split('\n')
-            # Show first 10 relevant forward rules
-            forward_rules = [line for line in lines if any(x in line for x in ['ACCEPT', 'DROP', 'REJECT']) and line.strip()][:10]
-            
-            if forward_rules:
-                for rule in forward_rules:
-                    console.print(f"  {rule.strip()}")
-            else:
-                console.print("  [yellow]No forward rules found[/yellow]")
-        
-        # Show banned IPs
+                console.print("  [yellow]No port forwarding configured[/yellow]")
+    
+    def _show_banned_ips_summary(self) -> None:
+        """Show banned IPs summary."""
         console.print("\n[cyan]Banned IPs:[/cyan]")
         banned_count = self._get_banned_ip_count()
+        
         if banned_count > 0:
-            console.print(f"  [yellow]{banned_count} IP(s) currently banned[/yellow]")
+            console.print(f"  [yellow]⚠ {banned_count} IP(s) banned[/yellow]")
         else:
-            console.print("  [green]No banned IPs[/green]")
+            console.print("  [green]✓ No banned IPs[/green]")
+    
+    def _show_rules_file_status(self) -> None:
+        """Show rules file status."""
+        console.print("\n[cyan]Rules Configuration:[/cyan]")
+        
+        if self.rules_file.exists():
+            lines = self.rules_file.read_text().split('\n')
+            rule_count = sum(1 for line in lines if line.strip() and not line.strip().startswith('#'))
+            console.print(f"  [green]✓ {rule_count} active rule(s)[/green]")
+            console.print(f"  Location: {self.rules_file}")
+        else:
+            console.print("  [yellow]No rules file configured[/yellow]")
     
     def manage_nat_rules(self) -> None:
         """Manage NAT/Masquerade rules."""
@@ -110,13 +436,14 @@ class FirewallManager:
             "Add masquerade rule",
             "Add SNAT rule",
             "Remove NAT rule",
+            "Edit rules file",
             "Back"
         ]
         
         for i, option in enumerate(options, 1):
             console.print(f"  {i}. {option}")
         
-        choice = IntPrompt.ask("Select option", choices=["1", "2", "3", "4", "5"])
+        choice = IntPrompt.ask("Select option", choices=[str(i) for i in range(1, 7)])
         
         if choice == 1:
             self._view_nat_rules()
@@ -126,6 +453,8 @@ class FirewallManager:
             self._add_snat_rule()
         elif choice == 4:
             self._remove_nat_rule()
+        elif choice == 5:
+            self._edit_rules_file()
     
     def manage_port_forwarding(self) -> None:
         """Manage port forwarding rules."""
@@ -139,13 +468,14 @@ class FirewallManager:
             "Add port forward",
             "Remove port forward",
             "Add range forward",
+            "Edit rules file",
             "Back"
         ]
         
         for i, option in enumerate(options, 1):
             console.print(f"  {i}. {option}")
         
-        choice = IntPrompt.ask("Select option", choices=["1", "2", "3", "4", "5"])
+        choice = IntPrompt.ask("Select option", choices=[str(i) for i in range(1, 7)])
         
         if choice == 1:
             self._view_port_forwards()
@@ -155,6 +485,8 @@ class FirewallManager:
             self._remove_port_forward()
         elif choice == 4:
             self._add_range_forward()
+        elif choice == 5:
+            self._edit_rules_file()
     
     def manage_forward_rules(self) -> None:
         """Manage FORWARD chain rules."""
@@ -168,13 +500,14 @@ class FirewallManager:
             "Add accept rule",
             "Add drop rule",
             "Remove forward rule",
+            "Edit rules file",
             "Back"
         ]
         
         for i, option in enumerate(options, 1):
             console.print(f"  {i}. {option}")
         
-        choice = IntPrompt.ask("Select option", choices=["1", "2", "3", "4", "5"])
+        choice = IntPrompt.ask("Select option", choices=[str(i) for i in range(1, 7)])
         
         if choice == 1:
             self._view_forward_rules()
@@ -184,6 +517,8 @@ class FirewallManager:
             self._add_forward_drop()
         elif choice == 4:
             self._remove_forward_rule()
+        elif choice == 5:
+            self._edit_rules_file()
     
     def manage_banned_ips(self) -> None:
         """Manage banned IP addresses."""
@@ -206,7 +541,7 @@ class FirewallManager:
         for i, option in enumerate(options, 1):
             console.print(f"  {i}. {option}")
         
-        choice = IntPrompt.ask("Select option", choices=["1", "2", "3", "4", "5", "6", "7", "8"])
+        choice = IntPrompt.ask("Select option", choices=[str(i) for i in range(1, 9)])
         
         if choice == 1:
             self._view_banned_ips()
@@ -230,49 +565,92 @@ class FirewallManager:
             border_style="cyan"
         ))
         
-        config = self.config_manager.load_config()
-        external_interface = config.get('external_interface', 'eth0')
-        subnet = config.get('server_subnet', '10.0.0.0/24')
+        # Check if service exists
+        if not self.service_file.exists():
+            console.print("[yellow]Firewall service not configured. Setting up...[/yellow]")
+            self.setup_firewall_service()
+        else:
+            console.print("[cyan]Restarting firewall service to apply rules...[/cyan]")
+            result = run_command(["systemctl", "restart", self.service_name], check=False)
+            
+            if result.returncode == 0:
+                console.print("[green]✓ Firewall rules applied[/green]")
+            else:
+                console.print("[red]Failed to restart firewall service[/red]")
+                console.print("[yellow]Try: systemctl status wireguard-firewall[/yellow]")
+    
+    def _edit_rules_file(self) -> None:
+        """Edit the firewall rules file."""
+        console.print(Panel.fit(
+            "[bold cyan]Edit Firewall Rules[/bold cyan]",
+            border_style="cyan"
+        ))
         
-        console.print(f"[cyan]External Interface:[/cyan] {external_interface}")
-        console.print(f"[cyan]VPN Subnet:[/cyan] {subnet}")
+        if not self.rules_file.exists():
+            console.print("[yellow]Rules file doesn't exist. Creating...[/yellow]")
+            self.setup_firewall_service()
         
-        if not prompt_yes_no("\nApply NAT rules?", default=True):
-            return
+        console.print(f"[cyan]Current rules file:[/cyan] {self.rules_file}")
+        console.print("\n[cyan]Current contents (first 20 lines):[/cyan]")
+        console.print("─" * 60)
         
-        # Enable IP forwarding
-        console.print("\n[cyan]Enabling IP forwarding...[/cyan]")
-        run_command(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=False)
+        if self.rules_file.exists():
+            lines = self.rules_file.read_text().split('\n')[:20]
+            for line in lines:
+                console.print(line)
+            if len(self.rules_file.read_text().split('\n')) > 20:
+                console.print("... (truncated)")
         
-        # Make it permanent
-        with open("/etc/sysctl.conf", "r") as f:
-            content = f.read()
+        console.print("─" * 60)
         
-        if "net.ipv4.ip_forward=1" not in content:
-            with open("/etc/sysctl.conf", "a") as f:
-                f.write("\nnet.ipv4.ip_forward=1\n")
+        console.print("\n[yellow]Options:[/yellow]")
+        console.print("  1. Add a new rule")
+        console.print("  2. View full file")
+        console.print("  3. Reload firewall service")
+        console.print("  4. Back")
         
-        # Add NAT rule
-        console.print("[cyan]Adding NAT rule...[/cyan]")
-        run_command([
-            "iptables", "-t", "nat", "-A", "POSTROUTING",
-            "-s", subnet, "-o", external_interface, "-j", "MASQUERADE"
-        ], check=False)
+        choice = IntPrompt.ask("Select option", choices=["1", "2", "3", "4"])
         
-        # Add forward rules
-        console.print("[cyan]Adding forward rules...[/cyan]")
-        run_command([
-            "iptables", "-A", "FORWARD", "-i", "wg0", "-j", "ACCEPT"
-        ], check=False)
+        if choice == 1:
+            self._add_rule_to_file()
+        elif choice == 2:
+            self._view_full_rules_file()
+        elif choice == 3:
+            run_command(["systemctl", "reload", self.service_name], check=False)
+            console.print("[green]✓ Firewall service reloaded[/green]")
+    
+    def _add_rule_to_file(self) -> None:
+        """Add a new rule to the rules file."""
+        console.print("\n[cyan]Add New Rule[/cyan]")
+        console.print("[dim]Enter iptables command (without 'sudo')[/dim]")
+        console.print("[dim]Example: iptables -A FORWARD -p tcp --dport 80 -j ACCEPT[/dim]")
         
-        run_command([
-            "iptables", "-A", "FORWARD", "-o", "wg0", "-j", "ACCEPT"
-        ], check=False)
+        rule = Prompt.ask("\nEnter rule")
         
-        console.print("\n[green]✓[/green] NAT rules applied")
-        
-        if prompt_yes_no("Save rules permanently (iptables-save)?", default=True):
-            self._save_iptables_rules()
+        if rule and rule.startswith('iptables'):
+            # Add to file
+            with open(self.rules_file, 'a') as f:
+                f.write(f"\n# Added via manager - {datetime.now():%Y-%m-%d %H:%M}\n")
+                f.write(f"{rule}\n")
+            
+            console.print("[green]✓ Rule added to file[/green]")
+            
+            if prompt_yes_no("Apply rule now?", default=True):
+                result = run_command(rule.split(), check=False)
+                if result.returncode == 0:
+                    console.print("[green]✓ Rule applied[/green]")
+                else:
+                    console.print("[red]Failed to apply rule[/red]")
+        else:
+            console.print("[yellow]Invalid rule format[/yellow]")
+    
+    def _view_full_rules_file(self) -> None:
+        """View the complete rules file."""
+        if self.rules_file.exists():
+            content = self.rules_file.read_text()
+            console.print(content)
+        else:
+            console.print("[yellow]Rules file not found[/yellow]")
     
     def _view_nat_rules(self) -> None:
         """View detailed NAT rules."""
@@ -291,17 +669,20 @@ class FirewallManager:
         source = Prompt.ask("Source subnet (e.g., 10.0.0.0/24)")
         interface = Prompt.ask("Output interface (e.g., eth0)")
         
-        cmd = [
-            "iptables", "-t", "nat", "-A", "POSTROUTING",
-            "-s", source, "-o", interface, "-j", "MASQUERADE"
-        ]
+        rule = f"iptables -t nat -A POSTROUTING -s {source} -o {interface} -j MASQUERADE"
         
-        console.print(f"\n[yellow]Command:[/yellow] {' '.join(cmd)}")
+        console.print(f"\n[yellow]Command:[/yellow] {rule}")
         
-        if prompt_yes_no("Execute this command?", default=True):
-            result = run_command(cmd, check=False)
+        if prompt_yes_no("Add this rule?", default=True):
+            # Add to rules file
+            with open(self.rules_file, 'a') as f:
+                f.write(f"\n# Masquerade rule - {datetime.now():%Y-%m-%d %H:%M}\n")
+                f.write(f"{rule}\n")
+            
+            # Apply immediately
+            result = run_command(rule.split(), check=False)
             if result.returncode == 0:
-                console.print("[green]✓[/green] Masquerade rule added")
+                console.print("[green]✓ Masquerade rule added[/green]")
             else:
                 console.print(f"[red]Failed: {result.stderr}[/red]")
     
@@ -313,18 +694,20 @@ class FirewallManager:
         interface = Prompt.ask("Output interface (e.g., eth0)")
         to_source = Prompt.ask("SNAT to IP address")
         
-        cmd = [
-            "iptables", "-t", "nat", "-A", "POSTROUTING",
-            "-s", source, "-o", interface, "-j", "SNAT",
-            "--to-source", to_source
-        ]
+        rule = f"iptables -t nat -A POSTROUTING -s {source} -o {interface} -j SNAT --to-source {to_source}"
         
-        console.print(f"\n[yellow]Command:[/yellow] {' '.join(cmd)}")
+        console.print(f"\n[yellow]Command:[/yellow] {rule}")
         
-        if prompt_yes_no("Execute this command?", default=True):
-            result = run_command(cmd, check=False)
+        if prompt_yes_no("Add this rule?", default=True):
+            # Add to rules file
+            with open(self.rules_file, 'a') as f:
+                f.write(f"\n# SNAT rule - {datetime.now():%Y-%m-%d %H:%M}\n")
+                f.write(f"{rule}\n")
+            
+            # Apply immediately
+            result = run_command(rule.split(), check=False)
             if result.returncode == 0:
-                console.print("[green]✓[/green] SNAT rule added")
+                console.print("[green]✓ SNAT rule added[/green]")
             else:
                 console.print(f"[red]Failed: {result.stderr}[/red]")
     
@@ -341,7 +724,8 @@ class FirewallManager:
         if prompt_yes_no(f"Remove rule #{line_num}?", default=False):
             result = run_command(cmd, check=False)
             if result.returncode == 0:
-                console.print("[green]✓[/green] Rule removed")
+                console.print("[green]✓ Rule removed from active firewall[/green]")
+                console.print("[yellow]Note: Update rules file to make permanent[/yellow]")
             else:
                 console.print(f"[red]Failed: {result.stderr}[/red]")
     
@@ -367,40 +751,38 @@ class FirewallManager:
         config = self.config_manager.load_config()
         external_interface = config.get('external_interface', 'eth0')
         
+        rules = []
         if protocol == "both":
             protocols = ["tcp", "udp"]
         else:
             protocols = [protocol]
         
         for proto in protocols:
-            # PREROUTING rule
-            cmd1 = [
-                "iptables", "-t", "nat", "-A", "PREROUTING",
-                "-i", external_interface, "-p", proto,
-                "--dport", str(external_port),
-                "-j", "DNAT", "--to-destination", f"{internal_ip}:{internal_port}"
-            ]
+            rules.append(
+                f"iptables -t nat -A PREROUTING -i {external_interface} -p {proto} " +
+                f"--dport {external_port} -j DNAT --to-destination {internal_ip}:{internal_port}"
+            )
+            rules.append(
+                f"iptables -A FORWARD -p {proto} -d {internal_ip} --dport {internal_port} -j ACCEPT"
+            )
+        
+        console.print("\n[yellow]Rules to add:[/yellow]")
+        for rule in rules:
+            console.print(f"  {rule}")
+        
+        if prompt_yes_no("Add these rules?", default=True):
+            # Add to rules file
+            with open(self.rules_file, 'a') as f:
+                f.write(f"\n# Port forward: {external_port} -> {internal_ip}:{internal_port} ({protocol})\n")
+                f.write(f"# Added: {datetime.now():%Y-%m-%d %H:%M}\n")
+                for rule in rules:
+                    f.write(f"{rule}\n")
             
-            # FORWARD rule
-            cmd2 = [
-                "iptables", "-A", "FORWARD",
-                "-p", proto, "-d", internal_ip,
-                "--dport", str(internal_port),
-                "-j", "ACCEPT"
-            ]
+            # Apply immediately
+            for rule in rules:
+                run_command(rule.split(), check=False)
             
-            console.print(f"\n[yellow]Commands:[/yellow]")
-            console.print(f"  {' '.join(cmd1)}")
-            console.print(f"  {' '.join(cmd2)}")
-            
-            if prompt_yes_no(f"Add port forward for {proto}?", default=True):
-                result1 = run_command(cmd1, check=False)
-                result2 = run_command(cmd2, check=False)
-                
-                if result1.returncode == 0 and result2.returncode == 0:
-                    console.print(f"[green]✓[/green] Port forward added: {external_port} -> {internal_ip}:{internal_port} ({proto})")
-                else:
-                    console.print("[red]Failed to add port forward[/red]")
+            console.print(f"[green]✓ Port forward added: {external_port} -> {internal_ip}:{internal_port}[/green]")
     
     def _add_range_forward(self) -> None:
         """Add port range forwarding."""
@@ -414,32 +796,33 @@ class FirewallManager:
         config = self.config_manager.load_config()
         external_interface = config.get('external_interface', 'eth0')
         
+        rules = []
         if protocol == "both":
             protocols = ["tcp", "udp"]
         else:
             protocols = [protocol]
         
         for proto in protocols:
-            # PREROUTING rule for range
-            cmd1 = [
-                "iptables", "-t", "nat", "-A", "PREROUTING",
-                "-i", external_interface, "-p", proto,
-                "--dport", f"{start_port}:{end_port}",
-                "-j", "DNAT", "--to-destination", internal_ip
-            ]
+            rules.append(
+                f"iptables -t nat -A PREROUTING -i {external_interface} -p {proto} " +
+                f"--dport {start_port}:{end_port} -j DNAT --to-destination {internal_ip}"
+            )
+            rules.append(
+                f"iptables -A FORWARD -p {proto} -d {internal_ip} --dport {start_port}:{end_port} -j ACCEPT"
+            )
+        
+        if prompt_yes_no(f"Add range forward {start_port}-{end_port} to {internal_ip}?", default=True):
+            # Add to rules file
+            with open(self.rules_file, 'a') as f:
+                f.write(f"\n# Port range forward: {start_port}-{end_port} -> {internal_ip} ({protocol})\n")
+                for rule in rules:
+                    f.write(f"{rule}\n")
             
-            # FORWARD rule for range
-            cmd2 = [
-                "iptables", "-A", "FORWARD",
-                "-p", proto, "-d", internal_ip,
-                "--dport", f"{start_port}:{end_port}",
-                "-j", "ACCEPT"
-            ]
+            # Apply immediately
+            for rule in rules:
+                run_command(rule.split(), check=False)
             
-            if prompt_yes_no(f"Add range forward {start_port}-{end_port} for {proto}?", default=True):
-                run_command(cmd1, check=False)
-                run_command(cmd2, check=False)
-                console.print(f"[green]✓[/green] Range forward added: {start_port}-{end_port} -> {internal_ip} ({proto})")
+            console.print(f"[green]✓ Range forward added[/green]")
     
     def _remove_port_forward(self) -> None:
         """Remove port forwarding rule."""
@@ -454,8 +837,8 @@ class FirewallManager:
         if prompt_yes_no(f"Remove port forward rule #{line_num}?", default=False):
             result = run_command(cmd, check=False)
             if result.returncode == 0:
-                console.print("[green]✓[/green] Port forward removed")
-                console.print("[yellow]Note: Remember to also remove corresponding FORWARD rule[/yellow]")
+                console.print("[green]✓ Port forward removed[/green]")
+                console.print("[yellow]Note: Also remove corresponding FORWARD rule[/yellow]")
             else:
                 console.print(f"[red]Failed: {result.stderr}[/red]")
     
@@ -478,25 +861,31 @@ class FirewallManager:
         interface_in = Prompt.ask("Input interface (leave empty for any)", default="")
         interface_out = Prompt.ask("Output interface (leave empty for any)", default="")
         
-        cmd = ["iptables", "-A", "FORWARD"]
+        cmd_parts = ["iptables", "-A", "FORWARD"]
         
         if source:
-            cmd.extend(["-s", source])
+            cmd_parts.extend(["-s", source])
         if dest:
-            cmd.extend(["-d", dest])
+            cmd_parts.extend(["-d", dest])
         if interface_in:
-            cmd.extend(["-i", interface_in])
+            cmd_parts.extend(["-i", interface_in])
         if interface_out:
-            cmd.extend(["-o", interface_out])
+            cmd_parts.extend(["-o", interface_out])
         
-        cmd.extend(["-j", "ACCEPT"])
+        cmd_parts.extend(["-j", "ACCEPT"])
+        rule = " ".join(cmd_parts)
         
-        console.print(f"\n[yellow]Command:[/yellow] {' '.join(cmd)}")
+        console.print(f"\n[yellow]Command:[/yellow] {rule}")
         
-        if prompt_yes_no("Execute this command?", default=True):
-            result = run_command(cmd, check=False)
+        if prompt_yes_no("Add this rule?", default=True):
+            # Add to rules file
+            with open(self.rules_file, 'a') as f:
+                f.write(f"\n# Forward accept rule - {datetime.now():%Y-%m-%d %H:%M}\n")
+                f.write(f"{rule}\n")
+            
+            result = run_command(cmd_parts, check=False)
             if result.returncode == 0:
-                console.print("[green]✓[/green] Forward accept rule added")
+                console.print("[green]✓ Forward accept rule added[/green]")
             else:
                 console.print(f"[red]Failed: {result.stderr}[/red]")
     
@@ -504,24 +893,28 @@ class FirewallManager:
         """Add DROP rule to FORWARD chain."""
         console.print("\n[cyan]Add Forward Drop Rule[/cyan]")
         
-        source = Prompt.ask("Source IP/subnet to block", default="")
+        source = Prompt.ask("Source IP/subnet to block")
         dest = Prompt.ask("Destination IP/subnet (leave empty for any)", default="")
         
-        cmd = ["iptables", "-A", "FORWARD"]
+        cmd_parts = ["iptables", "-A", "FORWARD", "-s", source]
         
-        if source:
-            cmd.extend(["-s", source])
         if dest:
-            cmd.extend(["-d", dest])
+            cmd_parts.extend(["-d", dest])
         
-        cmd.extend(["-j", "DROP"])
+        cmd_parts.extend(["-j", "DROP"])
+        rule = " ".join(cmd_parts)
         
-        console.print(f"\n[yellow]Command:[/yellow] {' '.join(cmd)}")
+        console.print(f"\n[yellow]Command:[/yellow] {rule}")
         
-        if prompt_yes_no("Execute this command?", default=True):
-            result = run_command(cmd, check=False)
+        if prompt_yes_no("Add this rule?", default=True):
+            # Add to rules file
+            with open(self.rules_file, 'a') as f:
+                f.write(f"\n# Forward drop rule - {datetime.now():%Y-%m-%d %H:%M}\n")
+                f.write(f"{rule}\n")
+            
+            result = run_command(cmd_parts, check=False)
             if result.returncode == 0:
-                console.print("[green]✓[/green] Forward drop rule added")
+                console.print("[green]✓ Forward drop rule added[/green]")
             else:
                 console.print(f"[red]Failed: {result.stderr}[/red]")
     
@@ -538,7 +931,7 @@ class FirewallManager:
         if prompt_yes_no(f"Remove forward rule #{line_num}?", default=False):
             result = run_command(cmd, check=False)
             if result.returncode == 0:
-                console.print("[green]✓[/green] Rule removed")
+                console.print("[green]✓ Rule removed[/green]")
             else:
                 console.print(f"[red]Failed: {result.stderr}[/red]")
     
@@ -560,7 +953,6 @@ class FirewallManager:
                 table = Table(show_header=True, header_style="bold magenta")
                 table.add_column("#", width=3)
                 table.add_column("IP Address")
-                table.add_column("Comment")
                 table.add_column("Packets", justify="right")
                 table.add_column("Bytes", justify="right")
                 
@@ -570,20 +962,15 @@ class FirewallManager:
                         num = parts[0]
                         packets = parts[1]
                         bytes_val = parts[2]
-                        ip = ""
-                        comment = ""
                         
                         # Find IP
-                        for i, part in enumerate(parts):
-                            if part in [parts[7], parts[8]] and '.' in part:
+                        ip = "unknown"
+                        for part in parts[7:]:
+                            if '.' in part:
                                 ip = part
                                 break
                         
-                        # Find comment
-                        if "/*" in rule and "*/" in rule:
-                            comment = rule[rule.find("/*")+2:rule.find("*/")].strip()
-                        
-                        table.add_row(num, ip, comment, packets, bytes_val)
+                        table.add_row(num, ip, packets, bytes_val)
                 
                 console.print(table)
             else:
@@ -591,32 +978,29 @@ class FirewallManager:
         else:
             console.print("[yellow]BANNED_IPS chain not found[/yellow]")
             if prompt_yes_no("Create BANNED_IPS chain?", default=True):
-                self._create_banned_ips_chain()
+                self._ensure_banned_ips_chain()
     
     def _ban_ip(self) -> None:
         """Ban an IP address."""
         console.print("\n[cyan]Ban IP Address[/cyan]")
         
         ip = Prompt.ask("IP address to ban")
-        comment = Prompt.ask("Comment/reason (optional)", default="")
+        comment = Prompt.ask("Comment/reason (optional)", default="Manual ban")
         
         # Ensure BANNED_IPS chain exists
         self._ensure_banned_ips_chain()
         
         # Add to BANNED_IPS chain
-        cmd = ["iptables", "-A", "BANNED_IPS", "-s", ip]
-        
-        if comment:
-            cmd.extend(["-m", "comment", "--comment", comment])
-        
-        cmd.extend(["-j", "DROP"])
+        cmd = ["iptables", "-A", "BANNED_IPS", "-s", ip, "-j", "DROP"]
         
         result = run_command(cmd, check=False)
         if result.returncode == 0:
-            console.print(f"[green]✓[/green] IP {ip} banned")
+            console.print(f"[green]✓ IP {ip} banned[/green]")
             
             # Save to file
-            self._save_banned_ip_to_file(ip, comment)
+            ensure_directory(self.firewall_dir)
+            with open(self.banned_ips_file, 'a') as f:
+                f.write(f"{ip} # {comment} # {datetime.now():%Y-%m-%d %H:%M}\n")
         else:
             console.print(f"[red]Failed to ban IP: {result.stderr}[/red]")
     
@@ -636,11 +1020,13 @@ class FirewallManager:
         
         result = run_command(cmd, check=False)
         if result.returncode == 0:
-            console.print(f"[green]✓[/green] IP unbanned")
+            console.print(f"[green]✓ IP unbanned[/green]")
             
             # Remove from file
-            if not choice.isdigit():
-                self._remove_banned_ip_from_file(choice)
+            if self.banned_ips_file.exists():
+                lines = self.banned_ips_file.read_text().split('\n')
+                new_lines = [line for line in lines if not line.startswith(choice)]
+                self.banned_ips_file.write_text('\n'.join(new_lines))
         else:
             console.print(f"[red]Failed to unban: {result.stderr}[/red]")
     
@@ -649,21 +1035,18 @@ class FirewallManager:
         console.print("\n[cyan]Ban IP Range[/cyan]")
         
         ip_range = Prompt.ask("IP range to ban (e.g., 192.168.1.0/24)")
-        comment = Prompt.ask("Comment/reason (optional)", default="")
+        comment = Prompt.ask("Comment/reason (optional)", default="Range ban")
         
         self._ensure_banned_ips_chain()
         
-        cmd = ["iptables", "-A", "BANNED_IPS", "-s", ip_range]
-        
-        if comment:
-            cmd.extend(["-m", "comment", "--comment", comment])
-        
-        cmd.extend(["-j", "DROP"])
+        cmd = ["iptables", "-A", "BANNED_IPS", "-s", ip_range, "-j", "DROP"]
         
         result = run_command(cmd, check=False)
         if result.returncode == 0:
-            console.print(f"[green]✓[/green] IP range {ip_range} banned")
-            self._save_banned_ip_to_file(ip_range, comment)
+            console.print(f"[green]✓ IP range {ip_range} banned[/green]")
+            
+            with open(self.banned_ips_file, 'a') as f:
+                f.write(f"{ip_range} # {comment} # {datetime.now():%Y-%m-%d %H:%M}\n")
         else:
             console.print(f"[red]Failed: {result.stderr}[/red]")
     
@@ -676,9 +1059,10 @@ class FirewallManager:
         run_command(["iptables", "-F", "BANNED_IPS"], check=False)
         
         # Clear file
-        self.banned_ips_file.write_text("")
+        if self.banned_ips_file.exists():
+            self.banned_ips_file.write_text("")
         
-        console.print("[green]✓[/green] All IP bans cleared")
+        console.print("[green]✓ All IP bans cleared[/green]")
     
     def _import_ban_list(self) -> None:
         """Import IP ban list from file."""
@@ -700,19 +1084,17 @@ class FirewallManager:
                 if line and not line.startswith('#'):
                     parts = line.split('#', 1)
                     ip = parts[0].strip()
-                    comment = parts[1].strip() if len(parts) > 1 else ""
+                    comment = parts[1].strip() if len(parts) > 1 else "Imported"
                     
-                    cmd = ["iptables", "-A", "BANNED_IPS", "-s", ip]
-                    if comment:
-                        cmd.extend(["-m", "comment", "--comment", comment])
-                    cmd.extend(["-j", "DROP"])
+                    cmd = ["iptables", "-A", "BANNED_IPS", "-s", ip, "-j", "DROP"]
                     
                     result = run_command(cmd, check=False)
                     if result.returncode == 0:
                         imported += 1
-                        self._save_banned_ip_to_file(ip, comment)
+                        with open(self.banned_ips_file, 'a') as bf:
+                            bf.write(f"{ip} # {comment} # {datetime.now():%Y-%m-%d %H:%M}\n")
         
-        console.print(f"[green]✓[/green] Imported {imported} IP ban(s)")
+        console.print(f"[green]✓ Imported {imported} IP ban(s)[/green]")
     
     def _export_ban_list(self) -> None:
         """Export IP ban list to file."""
@@ -720,32 +1102,14 @@ class FirewallManager:
         
         file_path = Prompt.ask("Export to file", default="/tmp/ban_list_export.txt")
         
-        result = run_command(
-            ["iptables", "-L", "BANNED_IPS", "-n"],
-            check=False
-        )
-        
-        if result.returncode == 0:
-            with open(file_path, 'w') as f:
-                f.write(f"# WireGuard Banned IPs - Exported {datetime.now()}\n")
-                f.write("# Format: IP_ADDRESS # comment\n\n")
-                
-                lines = result.stdout.split('\n')
-                for line in lines:
-                    if 'DROP' in line:
-                        parts = line.split()
-                        for part in parts:
-                            if '.' in part and '/' in part or '.' in part:
-                                f.write(f"{part}")
-                                if "/*" in line and "*/" in line:
-                                    comment = line[line.find("/*")+2:line.find("*/")].strip()
-                                    f.write(f" # {comment}")
-                                f.write("\n")
-                                break
+        with open(file_path, 'w') as f:
+            f.write(f"# WireGuard Banned IPs - Exported {datetime.now()}\n")
+            f.write("# Format: IP_ADDRESS # comment\n\n")
             
-            console.print(f"[green]✓[/green] Ban list exported to {file_path}")
-        else:
-            console.print("[red]Failed to export ban list[/red]")
+            if self.banned_ips_file.exists():
+                f.write(self.banned_ips_file.read_text())
+        
+        console.print(f"[green]✓ Ban list exported to {file_path}[/green]")
     
     def _ensure_banned_ips_chain(self) -> None:
         """Ensure BANNED_IPS chain exists."""
@@ -760,23 +1124,7 @@ class FirewallManager:
             run_command(["iptables", "-I", "INPUT", "1", "-j", "BANNED_IPS"], check=False)
             run_command(["iptables", "-I", "FORWARD", "1", "-j", "BANNED_IPS"], check=False)
             
-            console.print("[green]✓[/green] Created BANNED_IPS chain")
-    
-    def _create_banned_ips_chain(self) -> None:
-        """Create BANNED_IPS chain."""
-        self._ensure_banned_ips_chain()
-    
-    def _save_banned_ip_to_file(self, ip: str, comment: str = "") -> None:
-        """Save banned IP to file."""
-        with open(self.banned_ips_file, 'a') as f:
-            f.write(f"{ip} # {comment} # {datetime.now()}\n")
-    
-    def _remove_banned_ip_from_file(self, ip: str) -> None:
-        """Remove banned IP from file."""
-        if self.banned_ips_file.exists():
-            lines = self.banned_ips_file.read_text().split('\n')
-            new_lines = [line for line in lines if not line.startswith(ip)]
-            self.banned_ips_file.write_text('\n'.join(new_lines))
+            console.print("[green]✓ Created BANNED_IPS chain[/green]")
     
     def _get_banned_ip_count(self) -> int:
         """Get count of banned IPs."""
@@ -784,26 +1132,3 @@ class FirewallManager:
         if result.returncode == 0:
             return result.stdout.count('DROP')
         return 0
-    
-    def _save_iptables_rules(self) -> None:
-        """Save iptables rules permanently."""
-        console.print("\n[cyan]Saving iptables rules...[/cyan]")
-        
-        # For Debian/Ubuntu
-        if Path("/etc/iptables").exists():
-            run_command(["iptables-save"], check=False, capture_output=False)
-            console.print("[green]✓[/green] Rules saved (iptables-save)")
-        
-        # For systems with iptables-persistent
-        if Path("/etc/iptables/rules.v4").exists():
-            result = run_command(["iptables-save"], check=False)
-            if result.returncode == 0:
-                Path("/etc/iptables/rules.v4").write_text(result.stdout)
-                console.print("[green]✓[/green] Rules saved to /etc/iptables/rules.v4")
-        
-        # For RedHat/CentOS
-        elif Path("/etc/sysconfig/iptables").exists():
-            result = run_command(["iptables-save"], check=False)
-            if result.returncode == 0:
-                Path("/etc/sysconfig/iptables").write_text(result.stdout)
-                console.print("[green]✓[/green] Rules saved to /etc/sysconfig/iptables")
