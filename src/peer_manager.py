@@ -2,6 +2,7 @@
 
 import ipaddress
 import json
+import re
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional
@@ -60,6 +61,9 @@ class PeerManager:
         if not peer_name:
             console.print("[yellow]Cancelled[/yellow]")
             return
+        
+        # Sanitize peer name
+        peer_name = re.sub(r'[^a-zA-Z0-9\-_]', '-', peer_name)
         
         peer_config = PEERS_DIR / f"{peer_name}.conf"
         if peer_config.exists():
@@ -193,7 +197,16 @@ class PeerManager:
             border_style="cyan"
         ))
         
+        # Get peers from both metadata and config files
         peers = self._get_all_peers()
+        
+        # Also scan server configs for peers
+        server_peers = self._get_peers_from_server_configs()
+        
+        # Merge the two sources
+        for name, info in server_peers.items():
+            if name not in peers:
+                peers[name] = info
         
         if not peers:
             console.print("[yellow]No peers configured[/yellow]")
@@ -204,23 +217,22 @@ class PeerManager:
         table.add_column("Name", style="cyan")
         table.add_column("IP Address")
         table.add_column("Interface")
-        table.add_column("Created")
+        table.add_column("Status")
+        
+        # Get active peers
+        active_peers = self._get_active_peers()
         
         for i, (name, info) in enumerate(peers.items(), 1):
-            created = info.get('created', 'unknown')
-            if created != 'unknown':
-                try:
-                    dt = datetime.fromisoformat(created)
-                    created = dt.strftime("%Y-%m-%d %H:%M")
-                except:
-                    pass
+            # Check if peer is active
+            pub_key = info.get('public_key', '')
+            status = "[green]Active[/green]" if pub_key in active_peers else "[red]Inactive[/red]"
             
             table.add_row(
                 str(i),
                 name,
                 info.get('ip', 'unknown'),
                 info.get('interface', 'unknown'),
-                created
+                status
             )
         
         console.print(table)
@@ -270,7 +282,7 @@ class PeerManager:
                 continue
             
             # Skip backup files
-            if filename.endswith('.bak') or filename.endswith('.old') or filename.endswith('.snat'):
+            if filename.endswith('.bak') or filename.endswith('.old') or filename.endswith('.snat') or filename.endswith('.working'):
                 continue
             
             # Check if file contains [Interface] section
@@ -325,10 +337,50 @@ class PeerManager:
                         ip = ip.strip()
                         if '/' in ip:
                             ip = ip.split('/')[0]
-                        if ip and not ip.startswith('0.0.0.0'):
+                        if ip and not ip.startswith('0.0.0.0') and not ip.startswith('::'):
                             used_ips.append(ip)
         
         return used_ips
+    
+    def _get_peers_from_server_configs(self) -> Dict[str, Dict]:
+        """Extract peer information from server configuration files."""
+        peers = {}
+        
+        for interface_file in self._get_interfaces():
+            config_file = WIREGUARD_DIR / f"{interface_file}.conf"
+            if not config_file.exists():
+                continue
+            
+            content = config_file.read_text()
+            
+            # Parse peers from config
+            peer_pattern = r'#\s*Peer:\s*(.+?)\n.*?\[Peer\].*?AllowedIPs\s*=\s*([^\n]+)'
+            matches = re.finditer(peer_pattern, content, re.DOTALL)
+            
+            for match in matches:
+                peer_name = match.group(1).strip()
+                allowed_ips = match.group(2).strip()
+                
+                # Extract IP from AllowedIPs
+                ip = allowed_ips.split('/')[0] if '/' in allowed_ips else allowed_ips
+                
+                peers[peer_name] = {
+                    'interface': interface_file,
+                    'ip': ip,
+                    'source': 'config'
+                }
+        
+        return peers
+    
+    def _get_active_peers(self) -> List[str]:
+        """Get list of active peer public keys."""
+        active = []
+        
+        result = run_command(["wg", "show", "all", "peers"], check=False)
+        if result.returncode == 0 and result.stdout:
+            active = result.stdout.strip().split('\n')
+        
+        return active
     
     def _generate_peer_config(self, **kwargs) -> str:
         """Generate peer configuration."""
@@ -412,14 +464,30 @@ AllowedIPs = {peer_ip}/32"""
         """Get all peer information."""
         peers = {}
         
+        # First check metadata files
         for metadata_file in PEERS_DIR.glob("*.json"):
             peer_name = metadata_file.stem
             try:
                 with open(metadata_file, 'r') as f:
                     peers[peer_name] = json.load(f)
             except:
-                config_file = PEERS_DIR / f"{peer_name}.conf"
-                if config_file.exists():
+                pass
+        
+        # Also check for conf files without metadata
+        for config_file in PEERS_DIR.glob("*.conf"):
+            peer_name = config_file.stem
+            if peer_name not in peers:
+                # Try to extract info from config
+                try:
+                    content = config_file.read_text()
+                    ip_match = re.search(r'Address\s*=\s*([^/\n]+)', content)
+                    ip = ip_match.group(1).strip() if ip_match else 'unknown'
+                    peers[peer_name] = {
+                        'interface': 'unknown',
+                        'ip': ip,
+                        'source': 'config_only'
+                    }
+                except:
                     peers[peer_name] = {'interface': 'unknown', 'ip': 'unknown'}
         
         return peers

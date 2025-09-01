@@ -3,8 +3,6 @@
 # WireGuard Manager Uninstaller
 # This script removes all traces of wireguard-manager installations
 
-set -e
-
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -33,14 +31,11 @@ confirm() {
     local prompt="$1"
     local response
     read -p "$(echo -e ${YELLOW}${prompt} [Y/n]: ${NC})" response
-    case "$response" in
-        [nN][oO]|[nN]) 
-            return 1
-            ;;
-        *)
-            return 0
-            ;;
-    esac
+    if [[ "$response" =~ ^[nN][oO]?$ ]]; then
+        return 1
+    else
+        return 0
+    fi
 }
 
 # Check if running as root
@@ -63,8 +58,15 @@ REMOVED_ITEMS=0
 print_header "Stopping WireGuard Manager"
 
 # Kill any running Python processes related to wireguard_manager
-pkill -f "wireguard_manager" 2>/dev/null || true
-pkill -f "wg-manager" 2>/dev/null || true
+if pgrep -f "wireguard_manager" > /dev/null 2>&1; then
+    pkill -f "wireguard_manager" 2>/dev/null || true
+    print_color "$GREEN" "✓ Stopped wireguard_manager processes"
+fi
+
+if pgrep -f "wg-manager" > /dev/null 2>&1; then
+    pkill -f "wg-manager" 2>/dev/null || true
+    print_color "$GREEN" "✓ Stopped wg-manager processes"
+fi
 
 # 2. Remove pip/pip3 installations
 print_header "Removing pip installations"
@@ -108,15 +110,18 @@ for cmd_path in "${CMD_LOCATIONS[@]}"; do
     if [[ -f "$cmd_path" ]] || [[ -L "$cmd_path" ]]; then
         print_color "$YELLOW" "Found command at: $cmd_path"
         ((FOUND_ITEMS++))
-        rm -f "$cmd_path"
-        print_color "$GREEN" "✓ Removed $cmd_path"
-        ((REMOVED_ITEMS++))
+        if confirm "Remove $cmd_path?"; then
+            rm -f "$cmd_path"
+            print_color "$GREEN" "✓ Removed $cmd_path"
+            ((REMOVED_ITEMS++))
+        fi
     fi
 done
 
 # 4. Remove installation directories
 print_header "Removing installation directories"
 
+# Main installation directories
 INSTALL_DIRS=(
     "/opt/wireguard-manager"
     "/etc/wireguard/wireguard-manager"
@@ -124,27 +129,57 @@ INSTALL_DIRS=(
     "/usr/local/wireguard-manager"
 )
 
-# Also search for Python package directories
+for dir in "${INSTALL_DIRS[@]}"; do
+    if [[ -d "$dir" ]]; then
+        print_color "$YELLOW" "Found installation directory: $dir"
+        ((FOUND_ITEMS++))
+        
+        # Special handling for /etc/wireguard/wireguard-manager
+        if [[ "$dir" == "/etc/wireguard/wireguard-manager" ]]; then
+            print_color "$YELLOW" "This is the current installation directory"
+            if confirm "Remove $dir? (This will delete the installation)"; then
+                # Save the script path before deletion
+                SCRIPT_PATH="$0"
+                TEMP_SCRIPT="/tmp/uninstall_wg_manager_$$.sh"
+                cp "$SCRIPT_PATH" "$TEMP_SCRIPT"
+                chmod +x "$TEMP_SCRIPT"
+                
+                print_color "$YELLOW" "Directory will be removed after script completes"
+                REMOVE_CURRENT_DIR=1
+            fi
+        else
+            if confirm "Remove directory $dir?"; then
+                rm -rf "$dir"
+                print_color "$GREEN" "✓ Removed $dir"
+                ((REMOVED_ITEMS++))
+            fi
+        fi
+    fi
+done
+
+# Python package directories
+print_header "Removing Python packages"
+
 for python_version in python3.{6..12}; do
-    INSTALL_DIRS+=(
+    PYTHON_DIRS=(
         "/usr/local/lib/$python_version/dist-packages/wireguard_manager"
         "/usr/local/lib/$python_version/site-packages/wireguard_manager"
         "/usr/lib/$python_version/dist-packages/wireguard_manager"
         "/usr/lib/$python_version/site-packages/wireguard_manager"
         "$HOME/.local/lib/$python_version/site-packages/wireguard_manager"
+        "/usr/local/lib/$python_version/dist-packages/src"
+        "/usr/local/lib/$python_version/site-packages/src"
     )
-done
-
-for dir in "${INSTALL_DIRS[@]}"; do
-    if [[ -d "$dir" ]]; then
-        print_color "$YELLOW" "Found installation directory: $dir"
-        ((FOUND_ITEMS++))
-        if confirm "Remove directory $dir?"; then
+    
+    for dir in "${PYTHON_DIRS[@]}"; do
+        if [[ -d "$dir" ]]; then
+            print_color "$YELLOW" "Found Python package: $dir"
+            ((FOUND_ITEMS++))
             rm -rf "$dir"
             print_color "$GREEN" "✓ Removed $dir"
             ((REMOVED_ITEMS++))
         fi
-    fi
+    done
 done
 
 # 5. Remove systemd services
@@ -165,11 +200,14 @@ for service in "${SERVICES[@]}"; do
         systemctl stop "$service" 2>/dev/null || true
         systemctl disable "$service" 2>/dev/null || true
         rm -f "$service_file"
-        systemctl daemon-reload
         print_color "$GREEN" "✓ Removed $service service"
         ((REMOVED_ITEMS++))
     fi
 done
+
+if [[ $REMOVED_ITEMS -gt 0 ]]; then
+    systemctl daemon-reload
+fi
 
 # 6. Remove configuration files
 print_header "Removing configuration files"
@@ -194,34 +232,10 @@ for config_file in "${CONFIG_FILES[@]}"; do
     fi
 done
 
-# 7. Remove Python virtual environments
-print_header "Removing Python virtual environments"
-
-VENV_DIRS=(
-    "/etc/wireguard/wireguard-manager/venv"
-    "/opt/wireguard-manager/venv"
-    "/usr/local/wireguard-manager/venv"
-)
-
-# Check current directory
-if [[ -d "./venv" ]] && [[ -f "./wg-manager" || -f "./setup.py" ]]; then
-    VENV_DIRS+=("./venv")
-fi
-
-for venv_dir in "${VENV_DIRS[@]}"; do
-    if [[ -d "$venv_dir" ]]; then
-        print_color "$YELLOW" "Found virtual environment: $venv_dir"
-        ((FOUND_ITEMS++))
-        rm -rf "$venv_dir"
-        print_color "$GREEN" "✓ Removed $venv_dir"
-        ((REMOVED_ITEMS++))
-    fi
-done
-
-# 8. Remove egg-info directories
+# 7. Remove egg-info directories
 print_header "Removing egg-info directories"
 
-find /usr/local/lib /usr/lib $HOME/.local/lib /opt 2>/dev/null -type d \( -name "*wireguard*manager*.egg-info" -o -name "*wg*manager*.egg-info" \) | while read -r egg_dir; do
+find /usr/local/lib /usr/lib $HOME/.local/lib /opt 2>/dev/null -type d \( -name "*wireguard*manager*.egg-info" -o -name "*wg*manager*.egg-info" \) -print0 | while IFS= read -r -d '' egg_dir; do
     print_color "$YELLOW" "Found egg-info directory: $egg_dir"
     ((FOUND_ITEMS++))
     rm -rf "$egg_dir"
@@ -229,7 +243,7 @@ find /usr/local/lib /usr/lib $HOME/.local/lib /opt 2>/dev/null -type d \( -name 
     ((REMOVED_ITEMS++))
 done
 
-# 9. Clean up PATH modifications
+# 8. Clean up PATH modifications
 print_header "Cleaning shell configuration files"
 
 SHELL_CONFIGS=(
@@ -250,8 +264,8 @@ for config in "${SHELL_CONFIGS[@]}"; do
     fi
 done
 
-# 10. Optional: Clean up WireGuard Manager data (NOT core WireGuard configs)
-print_header "WireGuard Manager Data Cleanup"
+# 9. Optional: Clean up WireGuard Manager data
+print_header "WireGuard Manager Data Cleanup (Optional)"
 
 print_color "$YELLOW" "Remove WireGuard Manager data directories?"
 print_color "$RED" "Note: This will NOT affect your WireGuard configurations (wg*.conf files)"
@@ -261,28 +275,34 @@ if confirm "Remove WireGuard Manager data directories?"; then
     if [[ -d "/etc/wireguard/backups" ]]; then
         rm -rf /etc/wireguard/backups
         print_color "$GREEN" "✓ Removed backup directory"
+        ((REMOVED_ITEMS++))
     fi
     
-    # Peers directory (only if it contains .json files from the manager)
-    if [[ -d "/etc/wireguard/peers" ]] && ls /etc/wireguard/peers/*.json >/dev/null 2>&1; then
-        if confirm "Remove peer metadata files (*.json) from /etc/wireguard/peers?"; then
-            rm -f /etc/wireguard/peers/*.json
-            print_color "$GREEN" "✓ Removed peer metadata files"
-        fi
+    # Peers directory metadata
+    if [[ -d "/etc/wireguard/peers" ]]; then
+        # Only remove JSON metadata files, not conf files
+        find /etc/wireguard/peers -name "*.json" -delete 2>/dev/null
+        print_color "$GREEN" "✓ Removed peer metadata files"
     fi
     
-    # Manager-specific files (not core WireGuard configs)
+    # Config directory
+    if [[ -d "/etc/wireguard/configs" ]]; then
+        rm -rf /etc/wireguard/configs
+        print_color "$GREEN" "✓ Removed configs directory"
+        ((REMOVED_ITEMS++))
+    fi
+    
+    # Manager-specific files
     MANAGER_FILES=(
-        "/etc/wireguard/firewall-rules.conf"
-        "/etc/wireguard/banned_ips.txt"
-        "/etc/wireguard/params"
-        "/etc/wireguard/keys/*.json"
+        "/etc/wireguard/config.yaml"
+        "/etc/wireguard/defaults.json"
     )
     
     for file in "${MANAGER_FILES[@]}"; do
         if [[ -f "$file" ]]; then
             rm -f "$file"
             print_color "$GREEN" "✓ Removed $file"
+            ((REMOVED_ITEMS++))
         fi
     done
 fi
@@ -304,12 +324,34 @@ fi
 # Refresh command database
 print_color "$BLUE" "Refreshing command database..."
 hash -r 2>/dev/null || true
-which wg-manager &>/dev/null && print_color "$YELLOW" "Warning: wg-manager command still found in PATH" || print_color "$GREEN" "✓ wg-manager command removed from PATH"
-which wireguard-manager &>/dev/null && print_color "$YELLOW" "Warning: wireguard-manager command still found in PATH" || print_color "$GREEN" "✓ wireguard-manager command removed from PATH"
+
+# Check if commands still exist
+if which wg-manager &>/dev/null; then
+    print_color "$YELLOW" "Warning: wg-manager command still found in PATH"
+else
+    print_color "$GREEN" "✓ wg-manager command removed from PATH"
+fi
+
+if which wireguard-manager &>/dev/null; then
+    print_color "$YELLOW" "Warning: wireguard-manager command still found in PATH"
+else
+    print_color "$GREEN" "✓ wireguard-manager command removed from PATH"
+fi
 
 print_header "Uninstall Complete"
 print_color "$GREEN" "WireGuard Manager has been uninstalled."
 print_color "$YELLOW" "Your WireGuard configurations (wg*.conf) have been preserved."
 print_color "$YELLOW" "Your WireGuard installation remains intact."
+
+# Handle current directory removal if requested
+if [[ "${REMOVE_CURRENT_DIR}" == "1" ]]; then
+    print_color "$YELLOW" "Removing current installation directory..."
+    cd /tmp
+    rm -rf /etc/wireguard/wireguard-manager
+    print_color "$GREEN" "✓ Removed /etc/wireguard/wireguard-manager"
+    
+    # Clean up temp script
+    rm -f "$TEMP_SCRIPT"
+fi
 
 exit 0

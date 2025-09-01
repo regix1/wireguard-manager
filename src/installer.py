@@ -23,8 +23,7 @@ class WireGuardInstaller:
     def __init__(self):
         """Initialize installer."""
         self.install_dir = self._find_install_dir()
-        # Disabled - no real repo yet
-        self.repo_url = None  
+        self.repo_url = "https://github.com/regix1/wireguard-manager"  # Update when available
     
     def _find_install_dir(self) -> Path:
         """Find where the manager is installed."""
@@ -33,10 +32,11 @@ class WireGuardInstaller:
             Path.home() / "wireguard-manager",
             Path("/opt/wireguard-manager"),
             Path("/usr/local/wireguard-manager"),
+            Path("/etc/wireguard/wireguard-manager"),
         ]
         
         for loc in locations:
-            if loc.exists() and (loc / "setup.py").exists():
+            if loc.exists() and ((loc / "setup.py").exists() or (loc / "src").exists()):
                 return loc
         
         return Path(__file__).parent.parent
@@ -210,16 +210,87 @@ class WireGuardInstaller:
         
         console.print(f"Current version: {APP_VERSION}")
         
-        # Update check disabled - no repository set up yet
-        console.print("[yellow]Update checking is not configured[/yellow]")
-        console.print("This is a local installation")
-        console.print("\n[green]✓[/green] You are running version {APP_VERSION}")
+        if self.repo_url:
+            console.print("Checking for updates...")
+            try:
+                # Check GitHub releases
+                import requests
+                api_url = self.repo_url.replace("github.com", "api.github.com/repos") + "/releases/latest"
+                response = requests.get(api_url, timeout=5)
+                
+                if response.status_code == 200:
+                    latest = response.json()
+                    latest_version = latest.get("tag_name", "").lstrip("v")
+                    
+                    if latest_version and latest_version != APP_VERSION:
+                        console.print(f"[yellow]New version available: {latest_version}[/yellow]")
+                        console.print(f"Download: {latest.get('html_url', self.repo_url)}")
+                        
+                        if prompt_yes_no("Download and install update?", default=False):
+                            self.update_manager()
+                    else:
+                        console.print(f"[green]✓[/green] You are running the latest version {APP_VERSION}")
+                else:
+                    console.print("[yellow]Could not check for updates[/yellow]")
+            except Exception as e:
+                console.print(f"[yellow]Update check failed: {e}[/yellow]")
+        else:
+            console.print("[yellow]Update checking is not configured[/yellow]")
+            console.print("This is a local installation")
+            console.print(f"\n[green]✓[/green] You are running version {APP_VERSION}")
     
     def update_manager(self) -> None:
         """Update the WireGuard Manager."""
-        console.print("\n[cyan]WireGuard Manager Update[/cyan]")
-        console.print("[yellow]No update repository configured[/yellow]")
-        console.print("This is a local installation")
+        console.print(Panel.fit(
+            "[bold cyan]Update WireGuard Manager[/bold cyan]",
+            border_style="cyan"
+        ))
+        
+        if not self.repo_url:
+            console.print("[yellow]No update repository configured[/yellow]")
+            return
+        
+        console.print("Downloading latest version...")
+        
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Clone repository
+                result = run_command([
+                    "git", "clone", "--depth", "1", 
+                    self.repo_url, tmpdir
+                ], check=False)
+                
+                if result.returncode != 0:
+                    console.print("[red]Failed to download update[/red]")
+                    return
+                
+                # Backup current installation
+                from .backup import BackupManager
+                backup_mgr = BackupManager()
+                backup_path = backup_mgr.create_backup("before_update")
+                
+                # Copy new files
+                tmpdir_path = Path(tmpdir)
+                if (tmpdir_path / "src").exists():
+                    shutil.rmtree(self.install_dir / "src", ignore_errors=True)
+                    shutil.copytree(tmpdir_path / "src", self.install_dir / "src")
+                
+                if (tmpdir_path / "VERSION").exists():
+                    shutil.copy2(tmpdir_path / "VERSION", self.install_dir / "VERSION")
+                
+                # Update dependencies
+                if (tmpdir_path / "requirements.txt").exists():
+                    shutil.copy2(tmpdir_path / "requirements.txt", self.install_dir / "requirements.txt")
+                    run_command([
+                        sys.executable, "-m", "pip", "install", "-r",
+                        str(self.install_dir / "requirements.txt")
+                    ])
+                
+                console.print("[green]✓[/green] Update complete!")
+                console.print("Please restart the application")
+                
+        except Exception as e:
+            console.print(f"[red]Update failed: {e}[/red]")
     
     def install_manager(self) -> None:
         """Install WireGuard Manager system-wide."""
@@ -244,19 +315,31 @@ class WireGuardInstaller:
         
         # Create executable
         console.print(f"Creating executable at {bin_path}...")
+        
+        # Determine if using src or wireguard_manager directory
+        if (install_dir / "src").exists():
+            module_name = "src"
+        else:
+            module_name = "wireguard_manager"
+        
         bin_content = f"""#!/bin/bash
 cd {install_dir}
-{sys.executable} -m wireguard_manager "$@"
+if [ -d "venv" ]; then
+    source venv/bin/activate
+fi
+export PYTHONPATH="{install_dir}/{module_name}:$PYTHONPATH"
+{sys.executable} -m {module_name} "$@"
 """
         bin_path.write_text(bin_content)
         bin_path.chmod(0o755)
         
         # Install dependencies
         console.print("Installing dependencies...")
-        run_command([
-            sys.executable, "-m", "pip", "install", "-r",
-            str(install_dir / "requirements.txt")
-        ])
+        if (install_dir / "requirements.txt").exists():
+            run_command([
+                sys.executable, "-m", "pip", "install", "-r",
+                str(install_dir / "requirements.txt")
+            ])
         
         console.print("\n[green]✓[/green] Installation complete!")
         console.print("You can now run 'wg-manager' from anywhere")
@@ -278,6 +361,7 @@ cd {install_dir}
         install_paths = [
             Path("/opt/wireguard-manager"),
             Path("/usr/local/bin/wg-manager"),
+            Path("/usr/local/bin/wireguard-manager"),
         ]
         
         for path in install_paths:
@@ -287,6 +371,13 @@ cd {install_dir}
                     shutil.rmtree(path)
                 else:
                     path.unlink()
+        
+        # Clean pip packages
+        for pip_cmd in ["pip", "pip3"]:
+            try:
+                run_command([pip_cmd, "uninstall", "-y", "wireguard-manager"], check=False)
+            except:
+                pass
         
         console.print("\n[green]✓[/green] WireGuard Manager uninstalled")
         console.print(f"[cyan]WireGuard configurations remain in:[/cyan] {WIREGUARD_DIR}")
