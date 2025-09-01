@@ -433,17 +433,19 @@ exit 0"""
         
         options = [
             "View NAT rules",
-            "Add masquerade rule",
+            "Add masquerade rule", 
             "Add SNAT rule",
             "Remove NAT rule",
             "Edit rules file",
+            "Restart firewall service",  # Added
+            "Rebuild firewall service",   # Added
             "Back"
         ]
         
         for i, option in enumerate(options, 1):
             console.print(f"  {i}. {option}")
         
-        choice = IntPrompt.ask("Select option", choices=[str(i) for i in range(1, 7)])
+        choice = IntPrompt.ask("Select option", choices=[str(i) for i in range(1, 9)])
         
         if choice == 1:
             self._view_nat_rules()
@@ -455,6 +457,15 @@ exit 0"""
             self._remove_nat_rule()
         elif choice == 5:
             self._edit_rules_file()
+        elif choice == 6:
+            self.restart_firewall_service()
+            console.print("\n[dim]Press Enter to continue...[/dim]")
+            input()
+        elif choice == 7:
+            if prompt_yes_no("Rebuild firewall service from templates?", default=False):
+                self.setup_firewall_service()
+            console.print("\n[dim]Press Enter to continue...[/dim]")
+            input()
     
     def manage_port_forwarding(self) -> None:
         """Manage port forwarding rules."""
