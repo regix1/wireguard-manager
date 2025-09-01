@@ -123,6 +123,11 @@ class WireGuardManagerCLI:
         # Peer Management
         peer_category = MenuCategory("Peer Management", prefix="[P]")
         peer_category.add_item(MenuItem(
+            "List Peers",
+            self.wrap_action(self.peer_manager.list_peers),
+            description="Show all peers"
+        ))
+        peer_category.add_item(MenuItem(
             "Add Peer",
             self.wrap_action(self.peer_manager.add_peer),
             description="Add new VPN client"
@@ -133,14 +138,15 @@ class WireGuardManagerCLI:
             description="Remove existing peer"
         ))
         peer_category.add_item(MenuItem(
-            "List Peers",
-            self.wrap_action(self.peer_manager.list_peers),
-            description="Show all peers"
-        ))
-        peer_category.add_item(MenuItem(
             "Show QR Code",
             self.wrap_action(self.peer_manager.show_qr_code),
             description="Generate QR for mobile"
+        ))
+        peer_category.add_item(MenuItem(
+            "Configure Directories",
+            self.wrap_action(self.peer_manager.configure_peer_directories),
+            description="Set peer config locations",
+            style="yellow"
         ))
         self.menu.add_category(peer_category)
         
