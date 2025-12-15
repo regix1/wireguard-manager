@@ -34,7 +34,7 @@ fi
 
 # Install Python dependencies
 echo "Installing Python dependencies..."
-pip3 install pyyaml qrcode requests
+pip3 install pyyaml qrcode requests rich
 
 # Create symlink
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -62,6 +62,7 @@ echo
 echo "=== Installation Complete ==="
 echo
 echo "Usage:"
+echo "  sudo wg-manager              # Interactive menu"
 echo "  sudo wg-manager peer list"
 echo "  sudo wg-manager peer add myphone"
 echo "  sudo wg-manager service status"

@@ -5,7 +5,8 @@
       "Bash(ls:*)",
       "Bash(find:*)",
       "Bash(mv:*)",
-      "Bash(rm:*)"
+      "Bash(rm:*)",
+      "Bash(echo:*)"
     ]
   }
 }

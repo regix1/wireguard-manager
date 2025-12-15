@@ -510,9 +510,12 @@ Examples:
     # Parse arguments
     args = parser.parse_args()
 
+    # If no command, launch interactive menu
     if not args.command:
-        parser.print_help()
-        sys.exit(1)
+        require_root()
+        from src.menu import run as run_menu
+        run_menu()
+        return
 
     # Most commands need root
     if args.command not in ["--help", "-h"]:
