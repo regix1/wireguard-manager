@@ -102,7 +102,8 @@ def cmd_peer(args):
 
 def cmd_service(args):
     """Handle service commands."""
-    from src.service import control, status
+    from src.service import control
+    from src.service.status import status as show_service_status
 
     if args.service_action == "start":
         control.start(args.interface)
@@ -117,15 +118,16 @@ def cmd_service(args):
     elif args.service_action == "disable":
         control.disable(args.interface)
     elif args.service_action == "status":
-        status.status(args.interface if args.interface != "wg0" else None)
+        show_service_status(args.interface if args.interface != "wg0" else None)
 
 
 def cmd_firewall(args):
     """Handle firewall commands."""
-    from src.firewall import nat, forward, portfwd, ban, status, rules
+    from src.firewall import nat, forward, portfwd, ban, rules
+    from src.firewall.status import show_status as show_fw_status
 
     if args.fw_action == "status":
-        status.show_status()
+        show_fw_status()
 
     elif args.fw_action == "nat":
         if args.fw_subaction == "add":
