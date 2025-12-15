@@ -7,85 +7,86 @@ import socket
 import ipaddress
 from pathlib import Path
 from typing import Optional, List, Tuple
-import psutil
-from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
 
-console = Console()
 
-def check_root() -> None:
-    """Check if the script is running as root."""
-    if os.geteuid() != 0:
-        console.print("[red]✗ This application must be run as root[/red]")
+def check_root() -> bool:
+    """Check if running as root."""
+    return os.geteuid() == 0
+
+
+def require_root() -> None:
+    """Exit if not running as root."""
+    if not check_root():
+        print("Error: This command must be run as root")
         sys.exit(1)
 
-def run_command(
-    command: List[str],
+
+def run(
+    cmd: List[str],
     check: bool = True,
-    capture_output: bool = True,
-    text: bool = True,
-    timeout: Optional[int] = 30,
-    cwd: Optional[Path] = None,
-    input: Optional[str] = None,
+    capture: bool = True,
+    timeout: int = 30,
+    input_text: Optional[str] = None,
 ) -> subprocess.CompletedProcess:
-    """Run a shell command and return the result."""
+    """Run a shell command."""
     try:
-        if input is not None:
-            result = subprocess.run(
-                command,
-                input=input,
-                capture_output=capture_output,
-                text=text,
-                timeout=timeout,
-                cwd=cwd,
-                check=check,
-            )
-        else:
-            result = subprocess.run(
-                command,
-                check=check,
-                capture_output=capture_output,
-                text=text,
-                timeout=timeout,
-                cwd=cwd,
-            )
-        return result
-    except subprocess.TimeoutExpired:
-        console.print(f"[red]Command timed out: {' '.join(command)}[/red]")
-        raise
+        return subprocess.run(
+            cmd,
+            input=input_text,
+            capture_output=capture,
+            text=True,
+            timeout=timeout,
+            check=check,
+        )
     except subprocess.CalledProcessError as e:
         if check:
-            console.print(f"[red]Command failed: {' '.join(command)}[/red]")
+            print(f"Command failed: {' '.join(cmd)}")
             if e.stderr:
-                console.print(f"[red]Error: {e.stderr}[/red]")
+                print(f"Error: {e.stderr}")
+        raise
+    except subprocess.TimeoutExpired:
+        print(f"Command timed out: {' '.join(cmd)}")
         raise
 
-def check_service_status(interface: str) -> bool:
-    """Check if a WireGuard interface is active."""
-    try:
-        result = run_command(
-            ["systemctl", "is-active", "--quiet", f"wg-quick@{interface}"],
-            check=False,
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
 
-def get_server_ip() -> str:
+def run_silent(cmd: List[str], timeout: int = 30) -> Tuple[bool, str]:
+    """Run command silently, return (success, output)."""
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout
+        )
+        return result.returncode == 0, result.stdout
+    except Exception as e:
+        return False, str(e)
+
+
+def generate_keypair() -> Tuple[str, str]:
+    """Generate WireGuard private and public key pair."""
+    result = run(["wg", "genkey"])
+    private_key = result.stdout.strip()
+
+    result = run(["wg", "pubkey"], input_text=private_key)
+    public_key = result.stdout.strip()
+
+    return private_key, public_key
+
+
+def generate_psk() -> str:
+    """Generate WireGuard preshared key."""
+    result = run(["wg", "genpsk"])
+    return result.stdout.strip()
+
+
+def get_public_ip() -> str:
     """Get the server's public IP address."""
     try:
-        # Try external service first
-        result = run_command(
-            ["curl", "-s", "https://api.ipify.org"],
-            check=False,
-            timeout=5
-        )
+        result = run(["curl", "-s", "https://api.ipify.org"], check=False, timeout=5)
         if result.returncode == 0 and result.stdout:
             return result.stdout.strip()
     except Exception:
         pass
-    
-    # Fallback to local IP
+
+    # Fallback to local IP detection
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
@@ -93,61 +94,28 @@ def get_server_ip() -> str:
     except Exception:
         return "YOUR_SERVER_IP"
 
-def get_network_interfaces() -> List[str]:
-    """Get list of network interfaces."""
-    interfaces = []
-    for interface, addrs in psutil.net_if_addrs().items():
-        if interface != "lo":  # Skip loopback
-            interfaces.append(interface)
-    return sorted(interfaces)
 
-def prompt_yes_no(question: str, default: bool = True) -> bool:
-    """Prompt the user for a yes/no answer."""
-    from rich.prompt import Confirm
-    return Confirm.ask(question, default=default)
-
-def generate_key_pair() -> Tuple[str, str]:
-    """Generate WireGuard private and public key pair."""
-    # Generate private key
-    result = run_command(["wg", "genkey"])
-    private_key = result.stdout.strip()
-    
-    # Generate public key
-    result = run_command(
-        ["wg", "pubkey"],
-        input=private_key,
-        text=True,
-        capture_output=True
-    )
-    public_key = result.stdout.strip()
-    
-    return private_key, public_key
-
-def generate_preshared_key() -> str:
-    """Generate WireGuard preshared key."""
-    result = run_command(["wg", "genpsk"])
-    return result.stdout.strip()
-
-def get_next_available_ip(subnet: str, used_ips: List[str]) -> str:
-    """Get the next available IP address in a subnet."""
+def get_next_ip(subnet: str, used_ips: List[str]) -> str:
+    """Get next available IP in subnet."""
     network = ipaddress.ip_network(subnet, strict=False)
-    
-    # Convert used IPs to set for faster lookup
+
     used_set = set()
     for ip in used_ips:
         if '/' in ip:
             ip = ip.split('/')[0]
         used_set.add(ip)
-    
-    # Find next available IP (skip .0 and .1)
+
+    # Skip .0 (network) and .1 (usually server)
     for ip in network.hosts():
-        if str(ip) not in used_set and not str(ip).endswith('.0') and not str(ip).endswith('.1'):
-            return str(ip)
-    
+        ip_str = str(ip)
+        if ip_str not in used_set and not ip_str.endswith('.1'):
+            return ip_str
+
     raise ValueError("No available IP addresses in subnet")
 
-def validate_ip_address(ip: str) -> bool:
-    """Validate an IP address."""
+
+def validate_ip(ip: str) -> bool:
+    """Validate an IP address or CIDR."""
     try:
         if '/' in ip:
             ipaddress.ip_network(ip, strict=False)
@@ -157,36 +125,43 @@ def validate_ip_address(ip: str) -> bool:
     except ValueError:
         return False
 
-def ensure_directory(path: Path, mode: int = 0o755) -> None:
-    """Ensure a directory exists with proper permissions."""
-    path.mkdir(parents=True, exist_ok=True)
-    path.chmod(mode)
 
-def check_wireguard_installed() -> bool:
+def is_wireguard_installed() -> bool:
     """Check if WireGuard is installed."""
+    success, _ = run_silent(["which", "wg"])
+    return success
+
+
+def get_interfaces() -> List[str]:
+    """Get list of network interfaces."""
     try:
-        result = run_command(["which", "wg"], check=False)
-        return result.returncode == 0
+        result = run(["ip", "-o", "link", "show"], check=False)
+        interfaces = []
+        for line in result.stdout.strip().split('\n'):
+            if ':' in line:
+                parts = line.split(':')
+                if len(parts) >= 2:
+                    iface = parts[1].strip().split('@')[0]
+                    if iface not in ['lo']:
+                        interfaces.append(iface)
+        return sorted(set(interfaces))
     except Exception:
-        return False
+        return []
+
 
 def enable_ip_forwarding() -> None:
     """Enable IP forwarding."""
-    try:
-        # Enable temporarily
-        run_command(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=False)
-        run_command(["sysctl", "-w", "net.ipv6.conf.all.forwarding=1"], check=False)
-        
-        # Enable permanently
-        sysctl_conf = Path("/etc/sysctl.conf")
-        content = sysctl_conf.read_text() if sysctl_conf.exists() else ""
-        
+    run(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=False)
+    run(["sysctl", "-w", "net.ipv6.conf.all.forwarding=1"], check=False)
+
+    # Make permanent
+    sysctl_conf = Path("/etc/sysctl.conf")
+    if sysctl_conf.exists():
+        content = sysctl_conf.read_text()
         if "net.ipv4.ip_forward=1" not in content:
             with open(sysctl_conf, "a") as f:
                 f.write("\n# WireGuard IP Forwarding\n")
                 f.write("net.ipv4.ip_forward=1\n")
                 f.write("net.ipv6.conf.all.forwarding=1\n")
-        
-        console.print("[green]✓[/green] IP forwarding enabled")
-    except Exception as e:
-        console.print(f"[yellow]Warning: Could not enable IP forwarding: {e}[/yellow]")
+
+    print("IP forwarding enabled")
